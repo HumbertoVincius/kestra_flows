@@ -1,5 +1,5 @@
 id: hello-world
-namespace: dev
+namespace: user
 
 tasks:
   - id: hello
