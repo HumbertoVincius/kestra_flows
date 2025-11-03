@@ -1,7 +1,0 @@
-id: hello-world
-namespace: user
-
-tasks:
-  - id: hello
-    type: io.kestra.plugin.core.log.Log
-    message: Hello from GitHub!
