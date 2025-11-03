@@ -1,1 +1,16 @@
+id: main_python_flow
+namespace: projeto_exemplo # Importante: Deve corresponder ao targetNamespace do Flow de Sinc.
+description: Fluxo principal que executa o script Python de Hello World.
 
+tasks:
+  - id: executar_hello_world
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Executa o script 'meu_script.py' sincronizado do GitHub.
+    
+    # Habilita o acesso aos arquivos que foram sincronizados para o Namespace Files
+    namespaceFiles: 
+      enabled: true 
+      
+    commands:
+      # Chama o script Python que está no Namespace Files
+      - python meu_script.py
