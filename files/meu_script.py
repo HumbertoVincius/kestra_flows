@@ -4,7 +4,7 @@ import datetime
 import sys
 
 # 1. Mensagem simples para o log (stdout)
-print("👋 TESTANDO DO CURSOR")
+print("Novo teste de commit no cursor")
 
 # 2. Mostra a data e hora de execução
 current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
