@@ -11,6 +11,10 @@ tasks:
     namespaceFiles: 
       enabled: true 
       
+    beforeCommands:
+      # Instala o SDK do Kestra antes de executar o script
+      - pip install kestra
+    
     commands:
       # Chama o script Python que está no Namespace Files
       - python meu_script.py
