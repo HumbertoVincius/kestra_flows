@@ -4,7 +4,7 @@ import datetime
 import sys
 
 # 1. Mensagem simples para o log (stdout)
-print("Novo teste 4 de commit no cursor")
+print("fast git commit")
 
 # 2. Mostra a data e hora de execução
 current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
