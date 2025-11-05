@@ -12,8 +12,8 @@ tasks:
       enabled: true 
       
     beforeCommands:
-      # Instala o SDK do Kestra antes de executar o script
-      - pip install kestra
+      # Instala as dependências do requirements.txt antes de executar o script
+      - pip install kestra openai
     
     commands:
       # Chama o script Python que está no Namespace Files
