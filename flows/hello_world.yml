@@ -10,6 +10,10 @@ tasks:
     # Habilita o acesso aos arquivos que foram sincronizados para o Namespace Files
     namespaceFiles: 
       enabled: true 
+    
+    # Variáveis de ambiente para o script
+    env:
+      OPENAI_API_KEY: "{{ secret('OPENAI_API_KEY') }}"
       
     beforeCommands:
       # Instala as dependências do requirements.txt antes de executar o script
