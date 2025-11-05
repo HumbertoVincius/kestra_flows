@@ -17,4 +17,4 @@ tasks:
     
     commands:
       # Chama o script Python que está no Namespace Files
-      - python meu_script.py
+      - python scaffold.py
