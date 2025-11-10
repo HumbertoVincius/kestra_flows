@@ -612,7 +612,7 @@ if __name__ == "__main__":
     print("Parâmetros efetivos da execução:")
     print(f" - model: {system_model}")
     print(f" - provider: {system_provider}")
-    print(f" - system_revision: {system_rev or '<não informado>'}")
+    print(f" - parameters.notes: {CONFIG_PARAMETERS.get('notes') or '<não informado>'}")
 
     # Chama LLM
     resultado = call_llm(
