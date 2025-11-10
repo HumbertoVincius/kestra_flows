@@ -7,11 +7,94 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from supabase import create_client, Client
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Union, Iterable
 
 # Carrega variáveis de ambiente do arquivo .env na raiz do projeto
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
+
+CONFIG_PATH = Path(__file__).parent.parent / 'system' / 'prd_config.json'
+
+
+def _load_prd_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with CONFIG_PATH.open(encoding='utf-8') as config_file:
+            data = json.load(config_file)
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"⚠️  Falha ao ler prd_config.json: {exc}")
+    return {}
+
+
+def _normalize_str(value: Optional[str]) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _serialize_message_payload(payload: Union[str, dict, list, None]) -> Optional[str]:
+    if payload is None:
+        return None
+
+    if isinstance(payload, str):
+        return payload.strip() or None
+
+    if isinstance(payload, dict):
+        if not payload:
+            return None
+        if "content" in payload and isinstance(payload["content"], str):
+            content = payload["content"].strip()
+            if content:
+                return content
+        try:
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return str(payload)
+
+    if isinstance(payload, Iterable) and not isinstance(payload, (bytes, bytearray)):
+        if not payload:
+            return None
+        try:
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return "\n".join(str(item) for item in payload)
+
+    return str(payload)
+
+
+def _extract_config_params(config: dict) -> Tuple[dict, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    parameters = config.get("parameters") or {}
+    system_payload = config.get("system_message")
+    user_payload = config.get("user_message")
+
+    ai_model = _normalize_str(parameters.get("ai_model"))
+    provider = _normalize_str(parameters.get("provider"))
+
+    normalized_system = _serialize_message_payload(system_payload)
+    normalized_user = _serialize_message_payload(user_payload)
+
+    return parameters, normalized_system, normalized_user, ai_model, provider
+
+
+PRD_CONFIG = _load_prd_config()
+(
+    CONFIG_PARAMETERS,
+    CONFIG_SYSTEM_MESSAGE,
+    CONFIG_USER_MESSAGE,
+    CONFIG_AI_MODEL,
+    CONFIG_PROVIDER,
+) = _extract_config_params(PRD_CONFIG)
+
+CONFIG_PROVIDER = CONFIG_PROVIDER.lower() if CONFIG_PROVIDER else None
+CONFIG_TEMPERATURE = CONFIG_PARAMETERS.get("temperature")
+CONFIG_MAX_TOKENS = CONFIG_PARAMETERS.get("max_tokens")
+CONFIG_TOP_P = CONFIG_PARAMETERS.get("top_p")
+CONFIG_FREQUENCY_PENALTY = CONFIG_PARAMETERS.get("frequency_penalty")
+CONFIG_PRESENCE_PENALTY = CONFIG_PARAMETERS.get("presence_penalty")
+CONFIG_STOP = CONFIG_PARAMETERS.get("stop")
 
 # Inicializa o cliente OpenAI
 api_key = os.getenv("OPENAI_API_KEY")
@@ -253,32 +336,48 @@ def call_llm(
     provider: Optional[str] = None,
     max_tokens: int = 1536
 ):
-    
+
     try:
-        fetched_message = fetched_revision = fetched_model = fetched_provider = None
-        if (
+        if isinstance(model, str):
+            model = model.strip() or None
+        if isinstance(provider, str):
+            provider = provider.strip().lower() or None
+
+        # Overrides vindos do arquivo de configuração
+        if system_message is None:
+            system_message = CONFIG_SYSTEM_MESSAGE
+        if user_message is None:
+            user_message = CONFIG_USER_MESSAGE
+        if model is None:
+            model = CONFIG_AI_MODEL
+        if provider is None:
+            provider = CONFIG_PROVIDER
+
+        need_supabase_lookup = (
             system_message is None
-            or system_revision is None
             or model is None
-            or (isinstance(model, str) and model.strip() == "")
             or provider is None
-            or (isinstance(provider, str) and provider.strip() == "")
-        ):
+        )
+
+        fetched_message = fetched_revision = fetched_model = fetched_provider = None
+        if need_supabase_lookup:
             fetched_message, fetched_revision, fetched_model, fetched_provider = get_system_message()
-        
+
         if system_message is None:
             system_message = fetched_message
         if system_revision is None:
             system_revision = fetched_revision
-        if model is None or (isinstance(model, str) and model.strip() == ""):
+        if model is None:
             model = fetched_model or "gpt-4o"
-        if provider is None or (isinstance(provider, str) and provider.strip() == ""):
+        if provider is None:
             provider = fetched_provider
-        if provider is None or provider.strip() == "":
+
+        if provider is None:
             if isinstance(model, str) and model.lower().startswith("claude"):
                 provider = "anthropic"
             else:
-                provider = "openai"
+                provider = CONFIG_PROVIDER or "openai"
+
         provider = provider.lower()
 
         if provider == "openai" and isinstance(model, str) and model.lower().startswith("claude"):
@@ -287,7 +386,17 @@ def call_llm(
         
         if not user_message:
             raise ValueError("user_message é obrigatório")
-        
+
+        configured_max_tokens = max_tokens
+        if isinstance(CONFIG_MAX_TOKENS, int):
+            configured_max_tokens = CONFIG_MAX_TOKENS
+        elif configured_max_tokens is None:
+            configured_max_tokens = 1536
+
+        temperature_value = 0
+        if CONFIG_TEMPERATURE is not None:
+            temperature_value = CONFIG_TEMPERATURE
+
         print("chamando LLM")
         prd_content_raw: Optional[str] = None
         usage_info = {
@@ -302,8 +411,8 @@ def call_llm(
             response = anthropic_client.messages.create(
                 model=model,
                 system=system_message,
-                max_tokens=max_tokens,
-                temperature=0,
+                max_tokens=configured_max_tokens,
+                temperature=temperature_value,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -324,15 +433,25 @@ def call_llm(
                     "total_tokens": prompt_tokens + completion_tokens
                 }
         else:
-            response = openai_client.chat.completions.create(
-                model=model,
-                messages=[
+            openai_kwargs = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": user_message}
                 ],
-                temperature=0,
-                max_tokens=max_tokens
-            )
+                "temperature": temperature_value,
+                "max_tokens": configured_max_tokens
+            }
+            if CONFIG_TOP_P is not None:
+                openai_kwargs["top_p"] = CONFIG_TOP_P
+            if CONFIG_FREQUENCY_PENALTY is not None:
+                openai_kwargs["frequency_penalty"] = CONFIG_FREQUENCY_PENALTY
+            if CONFIG_PRESENCE_PENALTY is not None:
+                openai_kwargs["presence_penalty"] = CONFIG_PRESENCE_PENALTY
+            if CONFIG_STOP is not None:
+                openai_kwargs["stop"] = CONFIG_STOP
+
+            response = openai_client.chat.completions.create(**openai_kwargs)
             prd_content_raw = response.choices[0].message.content
             usage = response.usage
             prompt_tokens = usage.prompt_tokens if usage else 0
@@ -458,18 +577,43 @@ def save_to_prd_documents(result: dict):
 
 
 if __name__ == "__main__":
-    # Mensagem do usuário literal no script
-    user_msg = "Quero um sistema para cadastro de clientes com formulário de nome, e-mail e telefone. Preciso de uma tabela de listagem com busca e filtros, e um dashboard inicial com número total de clientes e um gráfico simples de crescimento mensal.Gostaria de ter modo escuro, autenticação simples por e-mail e uma página de configurações do usuário."
+    # Carrega mensagens e parâmetros a partir do arquivo de configuração
+    user_msg = CONFIG_USER_MESSAGE
+    system_msg = CONFIG_SYSTEM_MESSAGE
+    system_model = CONFIG_AI_MODEL
+    system_provider = CONFIG_PROVIDER
+    system_rev: Optional[str] = None
 
-    # Busca system_message do Supabase
-    system_msg, system_rev, system_model, system_provider = get_system_message()
-    if system_rev:
-        print(f"system_revision: {system_rev}")
-    if system_model:
-        print(f"system_model: {system_model}")
-    if system_provider:
-        print(f"system_provider: {system_provider}")
-    
+    if not user_msg:
+        raise ValueError(
+            "Defina user_message em system/prd_config.json ou forneça user_message explicitamente."
+        )
+
+    # Fallback para Supabase quando informações essenciais não estão no arquivo local
+    if system_msg is None or system_model is None or system_provider is None:
+        fetched_msg, fetched_rev, fetched_model, fetched_provider = get_system_message()
+        if system_msg is None:
+            system_msg = fetched_msg
+        system_rev = fetched_rev
+        if system_model is None:
+            system_model = fetched_model
+        if system_provider is None:
+            system_provider = fetched_provider
+
+    if system_msg is None:
+        raise ValueError("System message não encontrado. Configure em prd_config.json ou no Supabase.")
+
+    if system_model is None:
+        system_model = "gpt-4o"
+
+    if system_provider is None:
+        system_provider = "openai"
+
+    print("Parâmetros efetivos da execução:")
+    print(f" - model: {system_model}")
+    print(f" - provider: {system_provider}")
+    print(f" - system_revision: {system_rev or '<não informado>'}")
+
     # Chama LLM
     resultado = call_llm(
         system_message=system_msg,
