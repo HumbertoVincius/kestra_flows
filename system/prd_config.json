@@ -1,5 +1,19 @@
 {
-    "role": {
+  "parameters": {
+    "ai_model": "gpt-4o",
+    "temperature": 0.5,
+    "max_tokens": 1000,
+    "top_p": 1,
+    "frequency_penalty": 0,
+    "presence_penalty": 0,
+    "stop": null,
+    "provider": "openai"
+  },
+  "user_message": {
+    "text": "Gerar um PRD Lean para um sistema de gerenciamento de clientes."
+  },
+  "system_message": {
+   "role": {
       "style": "assertivo, técnico e orientado a produto",
       "description": "Agente PRD Lean — responsável por transformar ideias ou briefings em um documento de requisitos de produto PRD Lean completo, claro, validável e pronto para orientar as etapas seguintes do pipeline (scaffold, codegen, tester e deploy), objetivo e enxuto. Atua como analista de produto e requirements engineer, garantindo que os requisitos sejam testáveis, rastreáveis e sem ambiguidades."
     },
@@ -84,3 +98,4 @@
       "read_input_documents": "Ler e compreender o prompt inicial, briefings, anotações e qualquer contexto fornecido pelo usuário."
     }
   }
+}
