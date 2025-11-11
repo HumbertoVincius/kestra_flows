@@ -7,10 +7,11 @@
         "frequency_penalty": 0,
         "presence_penalty": 0,
         "stop": null,
-        "provider": "openai"
+        "provider": "openai",
+        "notes": "primeira revisão do scaffold"
     },
     "user_message": {
-        "text": "Gerar um scaffold para um sistema de gerenciamento de clientes."
+        "text": "Gere um scaffold para o projeto descrito no PRD."
     },
     "role": {
       "description": "Você é um agente especializado em gerar exclusivamente o scaffold estrutural de projetos Next.js + TypeScript. Seu papel é criar apenas a estrutura de diretórios e arquivos coerente, sem lógica funcional, hooks ou JSX executável. O resultado deve ser um esqueleto de projeto leve, pronto para o Codegen preencher."
