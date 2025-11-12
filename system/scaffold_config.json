@@ -7,7 +7,8 @@
     "frequency_penalty": 0,
     "presence_penalty": 0,
     "stop": null,
-    "provider": "openai"
+    "provider": "openai",
+    "notes": "primeira revisão do scaffold"
   },
   "user_message":  "Gere um scaffold para o projeto descrito no PRD.",
 
@@ -42,11 +43,17 @@
     "project_structure": "app/, src/lib/, src/types/, src/styles/, public/"
   },
   "contract": {
+    "output_format": "Responder estritamente com JSON válido (aspas duplas, sem comentários, sem blocos ```). Cada artifact deve ser um objeto { \"path\": string, \"content\": string } com o conteúdo textual do arquivo (sem JSON aninhado ou strings contendo JSON).",
     "artifacts": {
       "files_api": [],
       "files_app": [],
       "files_lib": [],
-      "files_root": [],
+      "files_root": [
+        {
+          "path": "package.json",
+          "content": "{\\n  \\\"name\\\": \\\"app\\\"\\n}"
+        }
+      ],
       "files_test": []
     },
     "path_policy": {
@@ -74,7 +81,7 @@
       ]
     },
     "requirements": [
-      "Cada artifact deve conter apenas estrutura textual coerente.",
+      "Cada artifact deve conter apenas estrutura textual coerente (content em string texto plano, sem JSON aninhado).",
       "Proibido incluir hooks, JSX funcional, lógica de estado, ou chamadas de API reais.",
       "Imports devem existir e ser resolvíveis dentro do scaffold.",
       "Todos os paths devem ser únicos e relativos.",
@@ -171,7 +178,7 @@
         "max_file_size_kb": 64
       }
     },
-    "communication_style": "Saída estritamente em JSON."
+    "communication_style": "Saída estritamente em JSON único, sem Markdown, sem blocos ``` e sem strings contendo JSON. Cada content deve ser texto puro com \n escapado conforme necessário."
   },
   "api_generation_policy": {
     "action": [
@@ -185,5 +192,5 @@
       "Rotas API devem ser textualmente válidas para build do Next.js."
     ]
   }
-}
+  }
 }
