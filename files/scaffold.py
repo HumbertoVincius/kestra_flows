@@ -164,6 +164,7 @@ def _extract_code_fence(raw_str: str) -> str:
 
 
 def _extract_first_json_object(raw_str: str) -> Optional[str]:
+    """Extrai o primeiro objeto JSON completo de uma string."""
     start = raw_str.find("{")
     if start == -1:
         return None
@@ -193,29 +194,120 @@ def _extract_first_json_object(raw_str: str) -> Optional[str]:
     return None
 
 
+def _extract_json_array(raw_str: str) -> Optional[str]:
+    """
+    Extrai um array JSON completo, mesmo se truncado.
+    Retorna o array mais completo possível ou None se não encontrar.
+    """
+    start = raw_str.find("[")
+    if start == -1:
+        return None
+    
+    depth = 0
+    in_string = False
+    escape = False
+    
+    for idx in range(start, len(raw_str)):
+        char = raw_str[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return raw_str[start : idx + 1]
+    
+    # Se não encontrou fechamento completo, retorna None (não queremos array parcial)
+    return None
+
+
+def _extract_all_json_objects(raw_str: str) -> list:
+    """
+    Extrai todos os objetos JSON válidos de uma string.
+    Útil para validar se conseguimos extrair tudo que está no raw_output.
+    """
+    objects = []
+    start = 0
+    
+    while start < len(raw_str):
+        obj_start = raw_str.find("{", start)
+        if obj_start == -1:
+            break
+        
+        obj_str = _extract_first_json_object(raw_str[obj_start:])
+        if obj_str:
+            try:
+                obj = json.loads(obj_str)
+                objects.append(obj)
+                start = obj_start + len(obj_str)
+            except json.JSONDecodeError:
+                start = obj_start + 1
+        else:
+            start = obj_start + 1
+    
+    return objects
+
+
+def _count_artifacts_in_raw(raw_str: str) -> int:
+    """
+    Conta quantos artifacts (objetos com 'path') existem no raw_output.
+    Usado para validar se extraímos tudo.
+    """
+    # Contar ocorrências de "path" que parecem ser chaves de artifacts
+    # Procura por padrão: "path": ou "path":
+    path_pattern = r'"path"\s*:'
+    matches = re.findall(path_pattern, raw_str)
+    return len(matches)
+
+
 def _parse_jsonish(raw_str: str) -> Any:
+    """
+    Versão melhorada do parser que tenta múltiplas estratégias.
+    Prioriza parsing completo sobre parcial.
+    """
+    # Estratégia 1: Tentar parsear como JSON completo (preferido)
     try:
-        return json.loads(raw_str)
+        parsed = json.loads(raw_str)
+        return parsed
     except json.JSONDecodeError:
         pass
+    
+    # Estratégia 2: Tentar extrair array JSON completo
+    array_str = _extract_json_array(raw_str)
+    if array_str:
+        try:
+            parsed = json.loads(array_str)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    # Estratégia 3: Tentar parsear como Python literal
     try:
-        return ast.literal_eval(raw_str)
+        parsed = ast.literal_eval(raw_str)
+        return parsed
     except (ValueError, SyntaxError):
         pass
+    
+    # Estratégia 4: Tentar normalizar aspas simples para duplas
     try:
         normalized = raw_str.replace("'", '"')
-        return json.loads(normalized)
+        parsed = json.loads(normalized)
+        return parsed
     except json.JSONDecodeError:
         pass
-    first_object = _extract_first_json_object(raw_str)
-    if first_object:
-        try:
-            return json.loads(first_object)
-        except json.JSONDecodeError:
-            try:
-                return ast.literal_eval(first_object)
-            except (ValueError, SyntaxError):
-                return None
+    
+    # NÃO usar fallback de primeiro objeto - queremos tudo ou nada
     return None
 
 
@@ -226,6 +318,96 @@ ARTIFACT_KEYS = [
     "files_api",
     "files_test",
 ]
+
+
+def _guess_code_language(path: str) -> str:
+    extension = Path(path).suffix.lower()
+    mapping = {
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".js": "javascript",
+        ".jsx": "jsx",
+        ".json": "json",
+        ".py": "python",
+        ".rb": "ruby",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".cs": "csharp",
+        ".html": "html",
+        ".css": "css",
+        ".scss": "scss",
+        ".md": "markdown",
+        ".yml": "yaml",
+        ".yaml": "yaml",
+        ".sql": "sql",
+        ".sh": "bash",
+        ".xml": "xml",
+        ".c": "c",
+        ".cpp": "cpp",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
+        ".nix": "nix",
+    }
+    return mapping.get(extension, "")
+
+
+def _format_prd_payload(prd_payload: Any, raw_output: Optional[str]) -> str:
+    sections: list[str] = []
+
+    if isinstance(prd_payload, dict):
+        summary = {key: value for key, value in prd_payload.items() if key != "artifacts"}
+        artifacts = prd_payload.get("artifacts")
+
+        if summary:
+            try:
+                summary_text = json.dumps(summary, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                summary_text = str(summary)
+            sections.append("[PRD SUMMARY]")
+            sections.append(summary_text)
+
+        if isinstance(artifacts, list) and artifacts:
+            artifact_lines: list[str] = ["[PRD ARTIFACTS]"]
+            for artifact in artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                path = str(artifact.get("path", "") or "").strip() or "<sem-path>"
+                content = artifact.get("content")
+                if isinstance(content, (dict, list)):
+                    content_text = json.dumps(content, ensure_ascii=False, indent=2)
+                elif content is None:
+                    content_text = ""
+                else:
+                    content_text = str(content)
+
+                language = _guess_code_language(path)
+                fence_header = f"```{language}" if language else "```"
+
+                artifact_lines.append(f"--- {path} ---")
+                artifact_lines.append(fence_header)
+                artifact_lines.append(content_text)
+                artifact_lines.append("```")
+                artifact_lines.append("")
+
+            if artifact_lines and artifact_lines[-1] == "":
+                artifact_lines.pop()
+
+            sections.append("\n".join(artifact_lines))
+
+        if sections:
+            return "\n\n".join(sections)
+
+    if isinstance(prd_payload, (dict, list)):
+        try:
+            return json.dumps(prd_payload, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(raw_output, str) and raw_output.strip():
+        return raw_output.strip()
+
+    return str(prd_payload) if prd_payload is not None else ""
 
 
 def _normalize_artifact_entry(entry: Any) -> dict:
@@ -244,53 +426,186 @@ def _normalize_artifact_entry(entry: Any) -> dict:
 
 
 def _normalize_scaffold_structure(data: Union[list, dict]) -> dict:
+    """
+    Normaliza a estrutura do scaffold preservando TODOS os artifacts.
+    Se houver erro ao normalizar algum item, propaga a exceção (não queremos resultado parcial).
+    Evita duplicação entre artifacts e files_root quando vierem da mesma fonte.
+    """
     result: dict[str, Any] = {}
     artifact_groups = {key: [] for key in ARTIFACT_KEYS}
 
     if isinstance(data, list):
-        artifact_groups["files_root"] = [_normalize_artifact_entry(item) for item in data]
-        return {key: value for key, value in artifact_groups.items() if value}
+        # Lista: coloca em files_root e artifacts (faz sentido para lista sem estrutura)
+        normalized_list = []
+        for idx, item in enumerate(data):
+            try:
+                normalized_item = _normalize_artifact_entry(item)
+                normalized_list.append(normalized_item)
+            except Exception as e:
+                raise ValueError(
+                    f"Erro ao normalizar item {idx} da lista: {e}. "
+                    f"Item: {json.dumps(item, ensure_ascii=False)[:200]}"
+                ) from e
+        
+        if normalized_list:
+            result["artifacts"] = normalized_list
+            result["files_root"] = normalized_list
+        
+        return result
 
     if not isinstance(data, dict):
         raise ValueError("Estrutura retornada pela LLM não é lista nem objeto")
 
+    # Processar dict - se algum item falhar, propaga erro
     for key, value in data.items():
         if key == "artifacts" and isinstance(value, list):
-            artifact_groups["files_root"].extend(_normalize_artifact_entry(item) for item in value)
+            normalized_artifacts = []
+            for idx, item in enumerate(value):
+                try:
+                    normalized_item = _normalize_artifact_entry(item)
+                    normalized_artifacts.append(normalized_item)
+                except Exception as e:
+                    raise ValueError(
+                        f"Erro ao normalizar artifact {idx} em 'artifacts': {e}. "
+                        f"Item: {json.dumps(item, ensure_ascii=False)[:200]}"
+                    ) from e
+            
+            result["artifacts"] = normalized_artifacts
+            
+            # Se há apenas "artifacts" (sem outras chaves de arquivos), não duplicar em files_root
+            # Se há outras chaves específicas junto, também não duplicar (artifacts já contém tudo)
+            # Só duplicar se vier como lista (caso tratado acima)
+            # Neste caso, não duplicamos para evitar redundância
+                
         elif key in ARTIFACT_KEYS and isinstance(value, list):
-            artifact_groups[key] = [_normalize_artifact_entry(item) for item in value]
+            normalized_items = []
+            for idx, item in enumerate(value):
+                try:
+                    normalized_item = _normalize_artifact_entry(item)
+                    normalized_items.append(normalized_item)
+                except Exception as e:
+                    raise ValueError(
+                        f"Erro ao normalizar {key}[{idx}]: {e}. "
+                        f"Item: {json.dumps(item, ensure_ascii=False)[:200]}"
+                    ) from e
+            artifact_groups[key] = normalized_items
+            result[key] = normalized_items
         else:
             result[key] = value
 
+    # Se não há "artifacts" mas há chaves específicas, criar artifacts agregando tudo
+    if "artifacts" not in result or not result["artifacts"]:
+        collected = []
+        for key in ARTIFACT_KEYS:
+            items = artifact_groups.get(key, [])
+            if items:
+                collected.extend(items)
+        
+        if collected:
+            result["artifacts"] = collected
+    
+    # Adicionar chaves de grupos que têm itens e ainda não estão no result
     for key, items in artifact_groups.items():
-        if items:
+        if items and key not in result:
             result[key] = items
 
     return result
 
 
 # === LLM Parsing ===
-def parse_scaffold_content(raw: Any) -> dict:
+def parse_scaffold_content(raw: Any, raw_output_str: Optional[str] = None) -> dict:
+    """
+    Parse e valida o conteúdo do scaffold com validação rigorosa.
+    
+    Se não conseguir extrair TODOS os artifacts do raw_output, lança erro.
+    Não retorna resultado parcial.
+    
+    Args:
+        raw: Dados brutos da LLM (pode ser dict, list ou string)
+        raw_output_str: String original do raw_output para validação (opcional)
+    
+    Returns:
+        dict: Estrutura normalizada com todos os artifacts
+        
+    Raises:
+        ValueError: Se não conseguir extrair todos os artifacts ou se houver perda de dados
+    """
+    parsed = None
+    raw_str_for_validation = None
+    
     if isinstance(raw, dict):
         parsed = raw
+        raw_str_for_validation = json.dumps(raw, ensure_ascii=False) if raw_output_str is None else raw_output_str
+    elif isinstance(raw, list):
+        parsed = raw
+        raw_str_for_validation = json.dumps(raw, ensure_ascii=False) if raw_output_str is None else raw_output_str
     else:
         if raw is None:
             raise ValueError("Resposta da LLM vazia para o Scaffold")
+        
         raw_str = str(raw).strip()
         if not raw_str:
             raise ValueError("Resposta da LLM vazia para o Scaffold")
+        
+        raw_str_for_validation = raw_str
         raw_str = _extract_code_fence(raw_str)
         parsed = _parse_jsonish(raw_str)
+        
         if parsed is None:
+            # Tentar extrair todos os objetos para ver quantos existem
+            all_objects = _extract_all_json_objects(raw_str)
+            if all_objects:
+                count_in_raw = len(all_objects)
+                raise ValueError(
+                    f"Não foi possível converter a resposta da LLM em JSON válido completo. "
+                    f"Encontrados {count_in_raw} objetos JSON válidos, mas não foi possível parsear como estrutura completa. "
+                    f"Isso pode indicar que a resposta foi truncada. "
+                    f"Trecho inicial: {raw_str[:500]}"
+                )
             raise ValueError(
-                "Não foi possível converter a resposta da LLM em JSON válido. Trecho inicial: "
-                + raw_str[:200]
+                f"Não foi possível converter a resposta da LLM em JSON válido. "
+                f"Trecho inicial: {raw_str[:500]}"
             )
-    if isinstance(parsed, list):
-        return _normalize_scaffold_structure(parsed)
-    if isinstance(parsed, dict):
-        return _normalize_scaffold_structure(parsed)
-    raise ValueError("Resposta da LLM não contém um objeto JSON válido")
+    
+    # Normalizar estrutura
+    normalized = _normalize_scaffold_structure(parsed)
+    
+    # Validação rigorosa: contar artifacts no raw vs normalizados
+    artifacts_normalized = normalized.get("artifacts", [])
+    artifacts_count = len(artifacts_normalized)
+    
+    if artifacts_count == 0:
+        raise ValueError(
+            "Nenhum artifact foi extraído da resposta da LLM. "
+            "A estrutura normalizada está vazia."
+        )
+    
+    # Se temos raw_output_str, validar que extraímos tudo
+    if raw_str_for_validation:
+        expected_count = _count_artifacts_in_raw(raw_str_for_validation)
+        
+        if expected_count > 0 and artifacts_count < expected_count:
+            # Tentar extrair todos os objetos para diagnóstico
+            all_objects = _extract_all_json_objects(raw_str_for_validation)
+            extracted_count = len(all_objects)
+            
+            raise ValueError(
+                f"PERDA DE DADOS DETECTADA: "
+                f"O raw_output contém {expected_count} artifacts (detectados por 'path'), "
+                f"mas apenas {artifacts_count} foram normalizados. "
+                f"Conseguimos extrair {extracted_count} objetos JSON válidos. "
+                f"Isso indica que a resposta pode estar truncada ou malformada. "
+                f"Não retornando resultado parcial para evitar dados inconsistentes. "
+                f"Considere aumentar max_tokens ou verificar se a resposta foi completada."
+            )
+        
+        # Log de sucesso
+        if expected_count > 0:
+            print(f"✅ Validação: {artifacts_count} artifacts extraídos de {expected_count} detectados no raw_output")
+        else:
+            print(f"✅ {artifacts_count} artifacts extraídos (validação por contagem não disponível)")
+    
+    return normalized
 
 
 # === Supabase helpers ===
@@ -353,7 +668,8 @@ def get_latest_prd() -> Tuple[str, Optional[str]]:
                 content = record.get("content") or {}
                 prd_id = record.get("prd_id")
                 prd_payload = content.get("content") if isinstance(content, dict) else content
-                prd_string = json.dumps(prd_payload, ensure_ascii=False, indent=2)
+                raw_output = content.get("raw_output") if isinstance(content, dict) else None
+                prd_string = _format_prd_payload(prd_payload, raw_output)
                 return prd_string, prd_id
         except Exception as exc:
             errors.append((column or "<sem ordenação>", str(exc)))
@@ -415,7 +731,8 @@ def call_llm(
     if isinstance(CONFIG_MAX_TOKENS, int):
         configured_max_tokens = CONFIG_MAX_TOKENS
     elif configured_max_tokens is None:
-        configured_max_tokens = 1536
+        # Aumentado de 1536 para 4000 para evitar truncamento de scaffolds grandes
+        configured_max_tokens = 4000
 
     temperature_value = CONFIG_TEMPERATURE if CONFIG_TEMPERATURE is not None else 0
 
@@ -486,8 +803,22 @@ def call_llm(
     if raw_output is None:
         raise ValueError("Resposta da LLM vazia")
 
-    normalized_content = parse_scaffold_content(raw_output)
-    content_estimate_source = raw_output if isinstance(raw_output, str) else json.dumps(raw_output)
+    # Log do tamanho da resposta para debug
+    raw_output_str = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, ensure_ascii=False)
+    print(f"📦 Raw output recebido: {len(raw_output_str)} caracteres")
+    
+    # Contar artifacts no raw para validação
+    artifacts_in_raw = _count_artifacts_in_raw(raw_output_str)
+    if artifacts_in_raw > 0:
+        print(f"📊 Artifacts detectados no raw_output: {artifacts_in_raw}")
+    
+    # Parsear com validação rigorosa (passa raw_output_str para validação)
+    normalized_content = parse_scaffold_content(raw_output, raw_output_str=raw_output_str)
+    
+    artifacts_count = len(normalized_content.get("artifacts", []))
+    print(f"✅ Artifacts normalizados: {artifacts_count}")
+    
+    content_estimate_source = raw_output_str
     doc_tokens = len(content_estimate_source) // 4 if content_estimate_source else 0
 
     metadata = {
@@ -554,9 +885,17 @@ def save_to_scaffold_documents(result: dict, prd_id: Optional[str]) -> dict:
 
 
 def build_user_message(prd_text: str, base_prompt: str) -> str:
-    prompt = base_prompt or ""
-    sections = [prompt.strip(), "\n\n[PRD]", prd_text.strip()]
-    return "\n".join(part for part in sections if part)
+    prompt = (base_prompt or "").strip()
+    prd_section = prd_text.strip()
+
+    sections = []
+    if prompt:
+        sections.append(prompt)
+    sections.append("[PRD]")
+    if prd_section:
+        sections.append(prd_section)
+
+    return "\n\n".join(sections)
 
 
 EXPECTED_FILE_KEYS = [
@@ -607,13 +946,16 @@ if __name__ == "__main__":
     print(f" - provider: {provider}")
     print(f" - notes: {CONFIG_PARAMETERS.get('notes') or '<não informado>'}")
 
+    # Aumentado max_tokens padrão para 4000 para evitar truncamento
+    max_tokens_value = CONFIG_MAX_TOKENS if isinstance(CONFIG_MAX_TOKENS, int) else 4000
+    
     resultado = call_llm(
         system_message=system_message,
         user_message=user_message,
         model=ai_model,
         provider=provider,
         system_revision=system_revision,
-        max_tokens=CONFIG_MAX_TOKENS or 1536,
+        max_tokens=max_tokens_value,
     )
 
     llm_meta = resultado["metadata"]

@@ -1,14 +1,14 @@
 {
   "parameters": {
-    "ai_model": "gpt-4o",
+    "ai_model": "gpt-5mini",
     "temperature": 0.5,
-    "max_tokens": 1000,
+    "max_tokens": 10000,
     "top_p": 1,
     "frequency_penalty": 0,
     "presence_penalty": 0,
     "stop": null,
     "provider": "openai",
-    "notes": "primeira revisão do scaffold"
+    "notes": "Revisão inicial do scaffold agent"
   },
   "user_message":  "Gere um scaffold para o projeto descrito no PRD.",
 
