@@ -277,6 +277,57 @@ def _parse_jsonish(raw_str: str) -> Any:
     return None
 
 
+def _normalize_artifact_entry(entry: Any) -> dict:
+    if not isinstance(entry, dict):
+        raise ValueError(f"Artifact inválido: {entry}")
+
+    path = entry.get("path")
+    content = entry.get("content")
+
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"Artifact sem path válido: {entry}")
+
+    if isinstance(content, (dict, list)):
+        content = json.dumps(content, ensure_ascii=False, indent=2)
+    elif content is None:
+        content = ""
+    else:
+        content = str(content)
+
+    return {"path": path.strip(), "content": content}
+
+
+def _normalize_artifact_lists(payload: dict) -> dict:
+    artifact_keys = [
+        "artifacts",
+        "files",
+        "file_entries",
+        "fileEntries",
+        "files_root",
+        "files_app",
+        "files_lib",
+        "files_api",
+        "files_test",
+    ]
+
+    normalized_payload = deepcopy(payload)
+    aggregated = []
+
+    for key in artifact_keys:
+        if key not in normalized_payload:
+            continue
+        value = normalized_payload[key]
+        if isinstance(value, list):
+            normalized_list = [_normalize_artifact_entry(item) for item in value]
+            normalized_payload[key] = normalized_list
+            aggregated.extend(normalized_list)
+
+    if aggregated:
+        normalized_payload["artifacts"] = aggregated
+
+    return normalized_payload
+
+
 def parse_prd_content(raw: Any) -> dict:
     """Normaliza a resposta da LLM para um dicionário JSON serializável."""
     if isinstance(raw, dict):
@@ -296,29 +347,33 @@ def parse_prd_content(raw: Any) -> dict:
                 + raw_str[:200]
             )
 
-    if not isinstance(parsed, dict):
-        raise ValueError("Resposta da LLM não contém um objeto JSON válido")
+    if isinstance(parsed, list):
+        normalized = {"artifacts": [_normalize_artifact_entry(item) for item in parsed]}
+    elif isinstance(parsed, dict):
+        data = deepcopy(parsed)
 
-    data = deepcopy(parsed)
+        if "prd" in data:
+            prd_value = data["prd"]
+            if isinstance(prd_value, str):
+                inner = _parse_jsonish(_extract_code_fence(prd_value.strip()))
+                if isinstance(inner, dict):
+                    prd_value = inner
+                else:
+                    raise ValueError("Não foi possível normalizar a chave 'prd' da resposta da LLM")
+            elif not isinstance(prd_value, dict):
+                raise ValueError("A chave 'prd' deve ser um objeto JSON")
 
-    if "prd" in data:
-        prd_value = data["prd"]
-        if isinstance(prd_value, str):
-            inner = _parse_jsonish(_extract_code_fence(prd_value.strip()))
-            if isinstance(inner, dict):
-                prd_value = inner
-            else:
-                raise ValueError("Não foi possível normalizar a chave 'prd' da resposta da LLM")
-        elif not isinstance(prd_value, dict):
-            raise ValueError("A chave 'prd' deve ser um objeto JSON")
+            content_dict = deepcopy(prd_value)
+            for key, value in data.items():
+                if key != "prd" and key not in content_dict:
+                    content_dict[key] = value
+            normalized = content_dict
+        else:
+            normalized = data
 
-        content_dict = deepcopy(prd_value)
-        for key, value in data.items():
-            if key != "prd" and key not in content_dict:
-                content_dict[key] = value
-        normalized = content_dict
+        normalized = _normalize_artifact_lists(normalized)
     else:
-        normalized = data
+        raise ValueError("Resposta da LLM não contém um objeto JSON válido")
 
     try:
         sanitized = json.loads(json.dumps(normalized))
@@ -473,6 +528,17 @@ def call_llm(
         content_estimate_source = prd_content_raw if isinstance(prd_content_raw, str) else json.dumps(prd_content_raw)
         prd_tokens = len(content_estimate_source) // 4 if content_estimate_source else 0
         
+        artifact_count = 0
+        artifact_characters = 0
+        if isinstance(normalized_content, dict):
+            artifacts = normalized_content.get("artifacts")
+            if isinstance(artifacts, list):
+                artifact_count = len(artifacts)
+                for artifact in artifacts:
+                    body = artifact.get("content")
+                    if isinstance(body, str):
+                        artifact_characters += len(body)
+
         # Monta o JSON de metadados
         metadata = {
             "prompt_tokens": usage_info["prompt_tokens"],
@@ -481,13 +547,16 @@ def call_llm(
             "agent_model": model,
             "provider": provider,
             "system_revision": system_revision or "",
-            "prd_tokens": prd_tokens
+            "prd_tokens": prd_tokens,
+            "artifact_count": artifact_count,
+            "artifact_characters": artifact_characters,
         }
         
         # Retorna a resposta e os metadados
         return {
             "content": normalized_content,
-            "metadata": metadata
+            "metadata": metadata,
+            "raw_output": prd_content_raw
         }
     
     except Exception as e:
@@ -500,7 +569,8 @@ def save_to_prd_documents(result: dict):
         # Monta o JSONB com content normalizado e metadata
         content_jsonb = {
             "metadata": result.get("metadata"),
-            "content": result.get("content")
+            "content": result.get("content"),
+            "raw_output": result.get("raw_output"),
         }
 
         # Verifica qual cliente está sendo usado
