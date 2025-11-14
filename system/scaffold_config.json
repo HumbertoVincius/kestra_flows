@@ -1,6 +1,6 @@
 {
   "parameters": {
-    "ai_model": "gpt-5mini",
+    "ai_model": "gpt-4o",
     "temperature": 0.5,
     "max_tokens": 10000,
     "top_p": 1,
@@ -10,7 +10,7 @@
     "provider": "openai",
     "notes": "Revisão inicial do scaffold agent"
   },
-  "user_message":  "Gere um scaffold para o projeto descrito no PRD.",
+  "user_message":  "Gere um scaffo'ld para o projeto descrito no PRD.",
 
   "system_message": {
   
@@ -43,7 +43,15 @@
     "project_structure": "app/, src/lib/, src/types/, src/styles/, public/"
   },
   "contract": {
-    "output_format": "Responder estritamente com JSON válido (aspas duplas, sem comentários, sem blocos ```). Cada artifact deve ser um objeto { \"path\": string, \"content\": string } com o conteúdo textual do arquivo (sem JSON aninhado ou strings contendo JSON).",
+    "output_format": "Responder estritamente com JSON válido (aspas duplas, sem comentários, sem blocos ```). Cada artifact deve ser um objeto { \"path\": string, \"content\": string } com o conteúdo textual do arquivo (sem JSON aninhado ou strings contendo JSON). OBRIGATÓRIO: Organizar artifacts em grupos específicos (files_root, files_app, files_lib, files_api, files_test). NÃO retornar apenas 'artifacts' como lista única.",
+    "structure_requirement": "OBRIGATÓRIO: Organizar artifacts em grupos específicos: files_root, files_app, files_lib, files_api, files_test. NÃO retornar apenas 'artifacts' como lista única. Cada arquivo deve estar no grupo correto baseado em seu path. Esta estrutura é essencial para o processamento posterior pelo codegen agent.",
+    "grouping_rules": {
+      "files_root": "Arquivos na raiz do projeto: package.json, tsconfig.json, next.config.js, tailwind.config.ts, postcss.config.js, .gitignore, .env.example, .nvmrc, .eslintrc.json e outros arquivos de configuração na raiz",
+      "files_app": "Arquivos em app/ (rotas, layouts, páginas): app/**/*.tsx, app/**/*.ts. Excluir app/api/ que vai em files_api",
+      "files_lib": "Arquivos em src/lib/ (utilitários, helpers, bibliotecas): src/lib/**/*.ts, src/lib/**/*.tsx. IMPORTANTE: src/styles/globals.css também deve ir em files_lib ou files_root",
+      "files_api": "Arquivos de API em app/api/: app/api/**/*.ts, app/api/**/*.tsx",
+      "files_test": "Arquivos de teste: **/*.test.ts, **/*.test.tsx, **/*.spec.ts, **/*.spec.tsx"
+    },
     "artifacts": {
       "files_api": [],
       "files_app": [],
@@ -81,11 +89,14 @@
       ]
     },
     "requirements": [
+      "OBRIGATÓRIO: Organizar todos os artifacts em grupos (files_root, files_app, files_lib, files_api, files_test). NUNCA retornar apenas uma lista 'artifacts' sem grupos.",
       "Cada artifact deve conter apenas estrutura textual coerente (content em string texto plano, sem JSON aninhado).",
       "Proibido incluir hooks, JSX funcional, lógica de estado, ou chamadas de API reais.",
       "Imports devem existir e ser resolvíveis dentro do scaffold.",
       "Todos os paths devem ser únicos e relativos.",
-      "Imports externos devem ter correspondência em package.json."
+      "Imports externos devem ter correspondência em package.json.",
+      "Distribuir arquivos nos grupos corretos baseado no path: arquivos em app/api/ → files_api, arquivos em app/ → files_app, arquivos em src/lib/ → files_lib, arquivos de teste → files_test, demais → files_root.",
+      "OBRIGATÓRIO: Sempre incluir src/styles/globals.css em files_lib (ou files_root se preferir) com conteúdo mínimo: @tailwind base;\\n@tailwind components;\\n@tailwind utilities;"
     ],
     "coherence_rules": [
       "Aliases '@/lib', '@/types', '@/styles' devem existir em tsconfig.paths.",
@@ -103,14 +114,14 @@
       ".nvmrc",
       "app/layout.tsx",
       "app/page.tsx",
-      "src/styles/globals.css"
+      "src/styles/globals.css (OBRIGATÓRIO: sempre incluir com @tailwind directives)"
     ]
   },
   "objective": {
     "primary_goal": "Emitir exclusivamente o esqueleto estrutural do projeto Next.js, sem lógica funcional.",
     "secondary_goal": "Garantir coerência entre estrutura, imports e dependências mínimas sem gerar código executável."
   },
-  "constraints": {
+    "constraints": {
     "musts": [
       "Gerar somente placeholders, funções vazias e estrutura coerente.",
       "package.json deve conter apenas dependências mínimas coerentes com a stack.",
@@ -119,7 +130,8 @@
       "Supabase helpers devem existir se PRD.data_model.length > 0 ou PRD.auth existir.",
       "Todos os arquivos .tsx devem retornar null ou conter apenas TODO comments.",
       "Arquivos de rota API devem exportar funções HTTP placeholders (GET, POST, etc.).",
-      "Todo arquivo .tsx que importe qualquer hook React (useState, useEffect, useRouter, useSearchParams, etc.) deve conter \"use client\" na primeira linha, sempre com aspas duplas."
+      "Todo arquivo .tsx que importe qualquer hook React (useState, useEffect, useRouter, useSearchParams, etc.) deve conter \"use client\" na primeira linha, sempre com aspas duplas.",
+      "OBRIGATÓRIO: Sempre incluir src/styles/globals.css com conteúdo: @tailwind base; @tailwind components; @tailwind utilities;"
     ],
     "must_not": [
       "Não incluir hooks React, JSX funcional",
@@ -178,7 +190,7 @@
         "max_file_size_kb": 64
       }
     },
-    "communication_style": "Saída estritamente em JSON único, sem Markdown, sem blocos ``` e sem strings contendo JSON. Cada content deve ser texto puro com \n escapado conforme necessário."
+    "communication_style": "Saída estritamente em JSON único, sem Markdown, sem blocos ``` e sem strings contendo JSON. Cada content deve ser texto puro com \n escapado conforme necessário. OBRIGATÓRIO: Retornar estrutura com grupos (files_root, files_app, files_lib, files_api, files_test), nunca apenas 'artifacts' como lista única."
   },
   "api_generation_policy": {
     "action": [
