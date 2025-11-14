@@ -320,6 +320,40 @@ ARTIFACT_KEYS = [
 ]
 
 
+def _distribute_artifacts_to_groups(artifacts: list) -> dict:
+    """
+    Distribui artifacts em grupos baseado no path quando a LLM retornar apenas 'artifacts'.
+    Esta função é usada como fallback quando a LLM não respeita a estrutura de grupos.
+    """
+    groups = {key: [] for key in ARTIFACT_KEYS}
+    
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        
+        path = artifact.get("path", "")
+        if not isinstance(path, str):
+            continue
+        
+        path_lower = path.lower()
+        
+        # Distribuir baseado no path
+        if path_lower.startswith("app/api/"):
+            groups["files_api"].append(artifact)
+        elif path_lower.startswith("app/"):
+            groups["files_app"].append(artifact)
+        elif path_lower.startswith("src/lib/") or path_lower.startswith("src/styles/"):
+            # src/lib/ e src/styles/ vão para files_lib
+            groups["files_lib"].append(artifact)
+        elif any(path_lower.endswith(ext) for ext in [".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"]):
+            groups["files_test"].append(artifact)
+        else:
+            # Arquivos na raiz ou outros
+            groups["files_root"].append(artifact)
+    
+    return groups
+
+
 def _guess_code_language(path: str) -> str:
     extension = Path(path).suffix.lower()
     mapping = {
@@ -430,12 +464,13 @@ def _normalize_scaffold_structure(data: Union[list, dict]) -> dict:
     Normaliza a estrutura do scaffold preservando TODOS os artifacts.
     Se houver erro ao normalizar algum item, propaga a exceção (não queremos resultado parcial).
     Evita duplicação entre artifacts e files_root quando vierem da mesma fonte.
+    Distribui automaticamente em grupos quando a LLM retornar apenas 'artifacts'.
     """
     result: dict[str, Any] = {}
     artifact_groups = {key: [] for key in ARTIFACT_KEYS}
 
     if isinstance(data, list):
-        # Lista: coloca em files_root e artifacts (faz sentido para lista sem estrutura)
+        # Lista: distribuir em grupos baseado no path
         normalized_list = []
         for idx, item in enumerate(data):
             try:
@@ -448,13 +483,23 @@ def _normalize_scaffold_structure(data: Union[list, dict]) -> dict:
                 ) from e
         
         if normalized_list:
-            result["artifacts"] = normalized_list
-            result["files_root"] = normalized_list
+            # Distribuir em grupos
+            distributed = _distribute_artifacts_to_groups(normalized_list)
+            for key in ARTIFACT_KEYS:
+                items = distributed.get(key, [])
+                artifact_groups[key] = items
+                result[key] = items  # Sempre incluir, mesmo se vazio
+            
+            # NÃO criar artifacts - arquivos ficam apenas nos grupos
         
         return result
 
     if not isinstance(data, dict):
         raise ValueError("Estrutura retornada pela LLM não é lista nem objeto")
+
+    # Verificar se há grupos específicos ou apenas 'artifacts'
+    has_specific_groups = any(key in ARTIFACT_KEYS for key in data.keys())
+    has_only_artifacts = "artifacts" in data and not has_specific_groups
 
     # Processar dict - se algum item falhar, propaga erro
     for key, value in data.items():
@@ -470,12 +515,23 @@ def _normalize_scaffold_structure(data: Union[list, dict]) -> dict:
                         f"Item: {json.dumps(item, ensure_ascii=False)[:200]}"
                     ) from e
             
-            result["artifacts"] = normalized_artifacts
-            
-            # Se há apenas "artifacts" (sem outras chaves de arquivos), não duplicar em files_root
-            # Se há outras chaves específicas junto, também não duplicar (artifacts já contém tudo)
-            # Só duplicar se vier como lista (caso tratado acima)
-            # Neste caso, não duplicamos para evitar redundância
+            # Se a LLM retornou apenas 'artifacts' sem grupos, distribuir automaticamente
+            if has_only_artifacts:
+                print("⚠️  LLM retornou apenas 'artifacts'. Distribuindo automaticamente em grupos baseado nos paths...")
+                distributed = _distribute_artifacts_to_groups(normalized_artifacts)
+                for group_key in ARTIFACT_KEYS:
+                    items = distributed.get(group_key, [])
+                    artifact_groups[group_key] = items
+                    result[group_key] = items  # Sempre incluir, mesmo se vazio
+                    if items:
+                        print(f"  ✅ {len(items)} arquivos distribuídos em {group_key}")
+                    else:
+                        print(f"  ⚪ {group_key} vazio (sem arquivos neste grupo)")
+                # NÃO criar artifacts - arquivos ficam apenas nos grupos
+            else:
+                # Se há grupos específicos junto com artifacts, ignorar artifacts e usar apenas os grupos
+                # Não adicionar artifacts ao result
+                pass
                 
         elif key in ARTIFACT_KEYS and isinstance(value, list):
             normalized_items = []
@@ -493,21 +549,19 @@ def _normalize_scaffold_structure(data: Union[list, dict]) -> dict:
         else:
             result[key] = value
 
-    # Se não há "artifacts" mas há chaves específicas, criar artifacts agregando tudo
-    if "artifacts" not in result or not result["artifacts"]:
-        collected = []
-        for key in ARTIFACT_KEYS:
-            items = artifact_groups.get(key, [])
-            if items:
-                collected.extend(items)
-        
-        if collected:
-            result["artifacts"] = collected
+    # Remover artifacts se existir - arquivos devem estar apenas nos grupos
+    if "artifacts" in result:
+        del result["artifacts"]
     
-    # Adicionar chaves de grupos que têm itens e ainda não estão no result
-    for key, items in artifact_groups.items():
-        if items and key not in result:
-            result[key] = items
+    # Garantir que TODOS os grupos estejam sempre presentes no result, mesmo que vazios
+    # Isso mantém a estrutura consistente para o codegen agent
+    for key in ARTIFACT_KEYS:
+        if key not in result:
+            # Se o grupo não existe no result, usar do artifact_groups ou lista vazia
+            result[key] = artifact_groups.get(key, [])
+        elif not isinstance(result.get(key), list):
+            # Se existe mas não é lista, garantir que seja lista vazia
+            result[key] = []
 
     return result
 
@@ -570,9 +624,12 @@ def parse_scaffold_content(raw: Any, raw_output_str: Optional[str] = None) -> di
     # Normalizar estrutura
     normalized = _normalize_scaffold_structure(parsed)
     
-    # Validação rigorosa: contar artifacts no raw vs normalizados
-    artifacts_normalized = normalized.get("artifacts", [])
-    artifacts_count = len(artifacts_normalized)
+    # Validação rigorosa: contar artifacts nos grupos (não há mais campo artifacts)
+    artifacts_count = 0
+    for key in ARTIFACT_KEYS:
+        items = normalized.get(key, [])
+        if isinstance(items, list):
+            artifacts_count += len(items)
     
     if artifacts_count == 0:
         raise ValueError(
@@ -815,8 +872,13 @@ def call_llm(
     # Parsear com validação rigorosa (passa raw_output_str para validação)
     normalized_content = parse_scaffold_content(raw_output, raw_output_str=raw_output_str)
     
-    artifacts_count = len(normalized_content.get("artifacts", []))
-    print(f"✅ Artifacts normalizados: {artifacts_count}")
+    # Contar artifacts dos grupos (não há mais campo artifacts)
+    artifacts_count = 0
+    for key in ARTIFACT_KEYS:
+        items = normalized_content.get(key, [])
+        if isinstance(items, list):
+            artifacts_count += len(items)
+    print(f"✅ Artifacts normalizados: {artifacts_count} (distribuídos em grupos)")
     
     content_estimate_source = raw_output_str
     doc_tokens = len(content_estimate_source) // 4 if content_estimate_source else 0
@@ -827,7 +889,7 @@ def call_llm(
         "total_tokens": usage_info["total_tokens"],
         "agent_model": model,
         "provider": provider,
-        "system_revision": system_revision or "",
+        "artifacts_count": artifacts_count,
         "scaffold_tokens": doc_tokens,
     }
 
