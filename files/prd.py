@@ -546,7 +546,6 @@ def call_llm(
             "total_tokens": usage_info["total_tokens"],
             "agent_model": model,
             "provider": provider,
-            "system_revision": system_revision or "",
             "prd_tokens": prd_tokens,
             "artifact_count": artifact_count,
             "artifact_characters": artifact_characters,
@@ -603,9 +602,9 @@ def save_to_prd_documents(result: dict):
                     "project_id": PROJECT_ID,
                     "from_agent": PRD_AGENT_NAME,
                     "to_agent": SCAFFOLD_AGENT_NAME,
-                    "status": MESSAGE_CONTENT_CREATED,
+                    "status": "pending",
                     "message_content": MESSAGE_CONTENT_CREATED,
-                    "prd_id": prd_id
+                    "prd_id": prd_id,
                 })\
                 .execute()
             print("log agent_messages registrado")

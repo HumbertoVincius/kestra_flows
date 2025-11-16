@@ -1,13 +1,13 @@
 {
   "parameters": {
-    "ai_model": "gpt-4o",
+    "ai_model": "sonnet-4.5",
     "temperature": 0.5,
     "max_tokens": 10000,
     "top_p": 1,
     "frequency_penalty": 0,
     "presence_penalty": 0,
     "stop": null,
-    "provider": "openai",
+    "provider": "anthropic",
     "notes": "Revisão inicial do scaffold agent"
   },
   "user_message":  "Gere um scaffo'ld para o projeto descrito no PRD.",

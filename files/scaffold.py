@@ -155,6 +155,7 @@ CODEGEN_AGENT_NAME = "codegen_agent"
 MESSAGE_CONTENT_CREATED = "scaffold_created"
 
 PRD_AGENT_NAME = "prd_agent"
+SCHEMA_AGENT_NAME = "schema_agent"
 
 
 # === Utilitários de parsing ===
@@ -710,30 +711,61 @@ def get_system_message() -> Tuple[str, Optional[str], Optional[str], Optional[st
         raise
 
 
-def get_latest_prd() -> Tuple[str, Optional[str]]:
-    order_columns = ["inserted_at", "created_at", "updated_at", None]
-    errors = []
-    for column in order_columns:
-        try:
-            query = supabase.table("prd_documents").select("prd_id, content")
-            if column:
-                query = query.select(f"prd_id, content, {column}")
-                query = query.order(column, desc=True)
-            response = query.limit(1).execute()
-            if response.data:
-                record = response.data[0]
-                content = record.get("content") or {}
-                prd_id = record.get("prd_id")
-                prd_payload = content.get("content") if isinstance(content, dict) else content
-                raw_output = content.get("raw_output") if isinstance(content, dict) else None
-                prd_string = _format_prd_payload(prd_payload, raw_output)
-                return prd_string, prd_id
-        except Exception as exc:
-            errors.append((column or "<sem ordenação>", str(exc)))
-            continue
-    for column, message in errors:
-        print(f"⚠️  Falha ao ordenar por '{column}': {message}")
-    raise ValueError("Não foi possível recuperar o PRD mais recente de prd_documents")
+def get_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Busca a mensagem mais recente de prd_agent -> scaffold_agent em agent_messages
+    e retorna o PRD correspondente.
+    """
+    try:
+        response = (
+            supabase.table("agent_messages")
+            .select("id, prd_id, status")
+            .eq("project_id", PROJECT_ID)
+            .eq("from_agent", PRD_AGENT_NAME)
+            .eq("to_agent", SCAFFOLD_AGENT_NAME)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise ValueError(f"Erro ao buscar agent_messages para scaffold_agent: {exc}") from exc
+
+    if not response.data:
+        # Nenhuma mensagem pendente para este agente
+        return None, None, None
+
+    record = response.data[0]
+    message_id = record.get("id")
+    prd_id = record.get("prd_id")
+    if not message_id or not prd_id:
+        raise ValueError(
+            "Mensagem encontrada em agent_messages não contém id ou prd_id válido. "
+            "Verifique se o prd_agent está salvando prd_id corretamente."
+        )
+
+    # Buscar PRD correspondente em prd_documents
+    try:
+        prd_response = (
+            supabase.table("prd_documents")
+            .select("prd_id, content")
+            .eq("prd_id", prd_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise ValueError(f"Erro ao buscar PRD com prd_id={prd_id}: {exc}") from exc
+
+    if not prd_response.data:
+        raise ValueError(f"PRD com prd_id={prd_id} não encontrado em prd_documents")
+
+    prd_record = prd_response.data[0]
+    content = prd_record.get("content") or {}
+    prd_payload = content.get("content") if isinstance(content, dict) else content
+    raw_output = content.get("raw_output") if isinstance(content, dict) else None
+    prd_string = _format_prd_payload(prd_payload, raw_output)
+
+    return prd_string, prd_id, message_id
 
 
 # === Função principal de chamada LLM ===
@@ -932,8 +964,8 @@ def save_to_scaffold_documents(result: dict, prd_id: Optional[str]) -> dict:
             .insert({
                 "project_id": PROJECT_ID,
                 "from_agent": SCAFFOLD_AGENT_NAME,
-                "to_agent": CODEGEN_AGENT_NAME,
-                "status": MESSAGE_CONTENT_CREATED,
+                "to_agent": SCHEMA_AGENT_NAME,
+                "status": "pending",
                 "message_content": MESSAGE_CONTENT_CREATED,
                 "prd_id": prd_id,
                 "scaffold_id": scaffold_id,
@@ -976,55 +1008,100 @@ if __name__ == "__main__":
             "Defina user_message em system/scaffold_config.json ou forneça user_message explicitamente."
         )
 
-    prd_text, prd_id = get_latest_prd()
-    user_message = build_user_message(prd_text, base_user_msg)
+    message_id: Optional[str] = None
 
-    system_message = CONFIG_SYSTEM_MESSAGE
-    ai_model = CONFIG_AI_MODEL
-    provider = CONFIG_PROVIDER
-    system_revision = None
+    try:
+        # Recupera o PRD a partir da mensagem pendente mais recente enviada pelo prd_agent
+        prd_text, prd_id, message_id = get_prd_from_message()
 
-    if system_message is None or ai_model is None or provider is None:
-        fetched_message, fetched_revision, fetched_model, fetched_provider = get_system_message()
+        if not prd_id or not prd_text or not message_id:
+            print("no pending messages")
+            raise SystemExit(0)
+
+        # Marcar mensagem como em processamento
+        try:
+            supabase.table("agent_messages")\
+                .update({"status": "processing"})\
+                .eq("id", message_id)\
+                .execute()
+        except Exception as exc:
+            print(f"⚠️  Falha ao marcar mensagem como processing: {exc}")
+
+        user_message = build_user_message(prd_text, base_user_msg)
+
+        system_message = CONFIG_SYSTEM_MESSAGE
+        ai_model = CONFIG_AI_MODEL
+        provider = CONFIG_PROVIDER
+        system_revision = None
+
+        if system_message is None or ai_model is None or provider is None:
+            fetched_message, fetched_revision, fetched_model, fetched_provider = get_system_message()
+            if system_message is None:
+                system_message = fetched_message
+            system_revision = fetched_revision
+            if ai_model is None:
+                ai_model = fetched_model
+            if provider is None:
+                provider = fetched_provider
+
         if system_message is None:
-            system_message = fetched_message
-        system_revision = fetched_revision
+            raise ValueError("System message não encontrado. Configure em scaffold_config.json ou no Supabase.")
+
         if ai_model is None:
-            ai_model = fetched_model
+            ai_model = "gpt-4o"
+
         if provider is None:
-            provider = fetched_provider
+            provider = "openai"
 
-    if system_message is None:
-        raise ValueError("System message não encontrado. Configure em scaffold_config.json ou no Supabase.")
+        print("Parâmetros efetivos da execução:")
+        print(f" - model: {ai_model}")
+        print(f" - provider: {provider}")
+        print(f" - notes: {CONFIG_PARAMETERS.get('notes') or '<não informado>'}")
 
-    if ai_model is None:
-        ai_model = "gpt-4o"
+        # Aumentado max_tokens padrão para 4000 para evitar truncamento
+        max_tokens_value = CONFIG_MAX_TOKENS if isinstance(CONFIG_MAX_TOKENS, int) else 4000
+        
+        resultado = call_llm(
+            system_message=system_message,
+            user_message=user_message,
+            model=ai_model,
+            provider=provider,
+            system_revision=system_revision,
+            max_tokens=max_tokens_value,
+        )
 
-    if provider is None:
-        provider = "openai"
+        llm_meta = resultado["metadata"]
+        total_tokens = llm_meta["total_tokens"]
+        print(f"resposta LLM: {total_tokens} total tokens")
 
-    print("Parâmetros efetivos da execução:")
-    print(f" - model: {ai_model}")
-    print(f" - provider: {provider}")
-    print(f" - notes: {CONFIG_PARAMETERS.get('notes') or '<não informado>'}")
+        saved_record = save_to_scaffold_documents(resultado, prd_id)
+        scaffold_tokens = llm_meta.get("scaffold_tokens")
+        print(f"scaffold salvo com sucesso: {scaffold_tokens} tokens")
+        print(f"scaffold_id: {saved_record.get('scaffold_id')}")
 
-    # Aumentado max_tokens padrão para 4000 para evitar truncamento
-    max_tokens_value = CONFIG_MAX_TOKENS if isinstance(CONFIG_MAX_TOKENS, int) else 4000
-    
-    resultado = call_llm(
-        system_message=system_message,
-        user_message=user_message,
-        model=ai_model,
-        provider=provider,
-        system_revision=system_revision,
-        max_tokens=max_tokens_value,
-    )
+        # Marcar mensagem original como ok
+        try:
+            supabase.table("agent_messages")\
+                .update({"status": "ok"})\
+                .eq("id", message_id)\
+                .execute()
+        except Exception as exc:
+            print(f"⚠️  Falha ao marcar mensagem como ok: {exc}")
 
-    llm_meta = resultado["metadata"]
-    total_tokens = llm_meta["total_tokens"]
-    print(f"resposta LLM: {total_tokens} total tokens")
-
-    saved_record = save_to_scaffold_documents(resultado, prd_id)
-    scaffold_tokens = llm_meta.get("scaffold_tokens")
-    print(f"scaffold salvo com sucesso: {scaffold_tokens} tokens")
-    print(f"scaffold_id: {saved_record.get('scaffold_id')}")
+    except SystemExit:
+        # Apenas re-levantar para encerrar sem erro adicional
+        raise
+    except Exception as e:
+        print(f"❌ Erro na execução do scaffold_agent: {e}")
+        if message_id:
+            try:
+                supabase.table("agent_messages")\
+                    .update({
+                        "status": "error",
+                        "message_content": f"scaffold_error: {str(e)}",
+                    })\
+                    .eq("id", message_id)\
+                    .execute()
+            except Exception as exc:
+                print(f"⚠️  Falha ao marcar mensagem como error: {exc}")
+        raise
