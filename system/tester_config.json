@@ -33,12 +33,13 @@
         "OBRIGATÓRIO: Gerar relatório no formato JSON especificado com seções 'summary' e 'files'.",
         "Seção 'summary' deve conter: 'overall_status' ('ok' ou 'not_ok'), 'total_files' (número), 'files_ok' (número), 'files_with_errors' (número), 'summary' (texto descritivo).",
         "Seção 'files' deve ser array onde cada item representa um arquivo validado com: 'file_path' (string), 'status' ('ok' ou 'error'), 'syntax_errors' (array de strings), 'logic_errors' (array de strings), 'build_errors' (array de strings), 'suggestions' (array de strings com propostas de correção).",
-        "Para cada arquivo, validar: sintaxe TypeScript/JavaScript (identificar erros de compilação), lógica (identificar problemas semânticos como imports faltando, tipos incorretos, uso incorreto de APIs), e problemas que impediriam build (dependências faltando, configurações incorretas).",
+        "Para cada arquivo, validar: sintaxe TypeScript/JavaScript (identificar erros de compilação), lógica (identificar problemas semânticos como imports faltando, exports inexistentes, tipos incorretos, uso incorreto de APIs), e problemas que impediriam build (dependências faltando, configurações incorretas). CRÍTICO: Verificar que TODOS os imports têm exports correspondentes nos arquivos importados. Se um arquivo importa `import { supabase } from '@/lib/supabase/client'`, verificar que `supabase` está realmente exportado em `@/lib/supabase/client`. Se não estiver, reportar como erro de lógica ou build error.",
         "Erros de sintaxe devem incluir linha, coluna e descrição clara do erro. Exemplo: 'Linha 45: Token inesperado '}' - possível chave de fechamento sem correspondência'.",
-        "Erros de lógica devem incluir descrição do problema e impacto. Exemplo: 'Import 'useRouter' de 'next/router' (legado) - deve usar 'next/navigation' conforme App Router'.",
+        "Erros de lógica devem incluir descrição do problema e impacto. Exemplo: 'Import 'useRouter' de 'next/router' (legado) - deve usar 'next/navigation' conforme App Router'. CRÍTICO: Se um arquivo tenta importar algo que não está exportado (ex.: `import { supabase } from '@/lib/supabase/client'` mas `supabase` não é exportado), isso DEVE ser reportado como erro de lógica com descrição clara: 'Import '{supabase}' de '@/lib/supabase/client' falhará - 'supabase' não está exportado neste arquivo. O arquivo exporta apenas {createBrowserClient}. Use hook useSupabase() ou chame createBrowserClient() dentro de useMemo/useEffect.'",
         "Build errors devem referenciar problemas que impedem build bem-sucedido. Exemplo: 'Variável de ambiente NEXT_PUBLIC_SUPABASE_URL não definida causará erro em runtime'.",
         "Sugestões devem ser específicas e acionáveis, incluindo código exemplo quando aplicável. Exemplo: 'Trocar linha X: import { useRouter } from \"next/router\" por: import { useRouter } from \"next/navigation\"'.",
         "Se 'eslint_output' ou 'build_output' estiverem disponíveis, incluí-los como strings no JSON de saída para referência.",
+        "CRÍTICO - Análise de build_output: Se build_output contiver erros como 'is not exported', 'Cannot find module', 'Module not found', 'Attempted import error', ou 'Import trace', esses erros DEVE ser incluídos nos 'build_errors' ou 'logic_errors' do arquivo correspondente. Analisar cada linha do build_output procurando por padrões de erro de importação/exportação e mapear para os arquivos corretos. Exemplo: se build_output contém 'Attempted import error: 'supabase' is not exported from '@/lib/supabase/client' (imported as 'supabase')' no arquivo './app/customers/new/page.tsx', isso DEVE aparecer como build_error ou logic_error em 'app/customers/new/page.tsx'.",
         "Marcar 'overall_status' como 'not_ok' se houver qualquer arquivo com 'status': 'error' ou se houver erros de build críticos."
       ],
       "forbidden": [
@@ -53,7 +54,9 @@
         "Verificar que 'files_ok' + 'files_with_errors' = 'total_files'.",
         "Garantir que 'overall_status' está correto baseado na presença de erros.",
         "Validar que cada erro listado tem descrição clara e sugestão de correção.",
-        "Confirmar que erros de ESLint e build foram capturados e incluídos nos outputs correspondentes."
+        "Confirmar que erros de ESLint e build foram capturados e incluídos nos outputs correspondentes.",
+        "CRÍTICO - Validar Exports/Imports: Para cada import encontrado no código, verificar que o export correspondente existe no arquivo importado. Se `import { X } from './file'`, verificar que `X` está exportado em `./file`. Se não estiver, reportar como erro de lógica ou build error com sugestão específica de correção.",
+        "CRÍTICO - Analisar build_output: Se build_output contiver erros, extrair TODOS os erros relacionados a imports/exports e incluí-los no relatório. Não ignorar erros do build_output mesmo que pareçam similares a erros já reportados. Mapear cada erro do build_output para o arquivo correto na seção 'files'."
       ]
     },
     "objective": {
