@@ -1,6 +1,6 @@
 {
   "parameters": {
-    "ai_model": "sonnet-4.5",
+    "ai_model": "claude-sonnet-4-5",
     "temperature": 0.5,
     "max_tokens": 10000,
     "top_p": 1,

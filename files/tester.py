@@ -160,6 +160,7 @@ supabase_write: Optional[Client] = None
 PROJECT_ID = "639e810b-9d8c-4f31-9569-ecf61fb43888"
 TESTER_AGENT_NAME = "tester_agent"
 CODEGEN_AGENT_NAME = "codegen_agent"
+DEPLOY_AGENT_NAME = "deploy_agent"
 MESSAGE_CONTENT_CREATED = "test_report_created"
 
 
@@ -236,7 +237,7 @@ def get_system_message() -> Tuple[str, Optional[str], Optional[str], Optional[st
         raise
 
 
-def get_codegen_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], List[Dict[str, str]]]:
+def get_codegen_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], List[Dict[str, str]], Optional[List[str]]]:
     """
     Busca a mensagem mais recente de codegen_agent -> tester_agent em agent_messages
     e retorna o codegen correspondente, com prd_id, scaffold_id e artifacts.
@@ -244,7 +245,7 @@ def get_codegen_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, codegen_id, prd_id, scaffold_id, schema_id, status")
+            .select("id, codegen_id, prd_id, scaffold_id, schema_id, status, message_content")
             .eq("project_id", PROJECT_ID)
             .eq("from_agent", CODEGEN_AGENT_NAME)
             .eq("to_agent", TESTER_AGENT_NAME)
@@ -258,7 +259,7 @@ def get_codegen_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
 
     if not response.data:
         # Nenhuma mensagem pendente para este agente
-        return None, None, None, None, None, None, []
+        return None, None, None, None, None, None, [], None
 
     msg_record = response.data[0]
     message_id = msg_record.get("id")
@@ -266,6 +267,7 @@ def get_codegen_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
     prd_id = msg_record.get("prd_id")
     scaffold_id = msg_record.get("scaffold_id")
     schema_id = msg_record.get("schema_id")
+    message_content = msg_record.get("message_content")
 
     if not message_id or not codegen_id:
         raise ValueError(
@@ -308,9 +310,26 @@ def get_codegen_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
                 if isinstance(a, dict) and a.get("path")
             ]
 
+    # Extrair corrected_files do message_content se for JSON estruturado
+    corrected_files = None
+    if message_content:
+        try:
+            if isinstance(message_content, str):
+                content_parsed = json.loads(message_content)
+            else:
+                content_parsed = message_content
+            
+            if isinstance(content_parsed, dict) and content_parsed.get("type") == "test_request":
+                corrected_files = content_parsed.get("corrected_files", [])
+                if corrected_files:
+                    print(f"📋 Arquivos corrigidos identificados no message_content: {len(corrected_files)} arquivos")
+        except (json.JSONDecodeError, TypeError):
+            # message_content não é JSON, é string simples (criação inicial)
+            pass
+
     # Formatar content para texto
     content_text = json.dumps(content, ensure_ascii=False, indent=2)
-    return content_text, codegen_id, prd_id, scaffold_id, schema_id, message_id, artifacts
+    return content_text, codegen_id, prd_id, scaffold_id, schema_id, message_id, artifacts, corrected_files
 
 
 def extract_artifacts_from_codegen(codegen_content: str) -> List[Dict[str, str]]:
@@ -1065,14 +1084,40 @@ def save_to_tester_documents(
     tester_record = response.data[0]
     tester_id = tester_record.get("tester_id")
 
+    # Extrair arquivos com erro do relatório para message_content
+    report = result.get("content", {}).get("report", {})
+    files_with_errors_list = []
+    if isinstance(report, dict):
+        report_files = report.get("files", [])
+        if isinstance(report_files, list):
+            for file_info in report_files:
+                if isinstance(file_info, dict):
+                    file_path = file_info.get("file_path", "")
+                    file_status = file_info.get("status", "")
+                    if file_path and file_status == "error":
+                        files_with_errors_list.append(file_path)
+    
+    # Determinar destinatário e message_content baseado na presença de erros
+    if files_with_errors_list:
+        # Se houver erros: enviar para codegen_agent para correção
+        to_agent = CODEGEN_AGENT_NAME
+        message_content = json.dumps({
+            "type": "correction_request",
+            "files_with_errors": files_with_errors_list
+        }, ensure_ascii=False)
+    else:
+        # Se não houver erros: enviar para deploy_agent para deploy
+        to_agent = DEPLOY_AGENT_NAME
+        message_content = MESSAGE_CONTENT_CREATED
+
     try:
         write_client.table("agent_messages")\
             .insert({
                 "project_id": PROJECT_ID,
                 "from_agent": TESTER_AGENT_NAME,
-                "to_agent": CODEGEN_AGENT_NAME,
+                "to_agent": to_agent,
                 "status": "pending",
-                "message_content": MESSAGE_CONTENT_CREATED,
+                "message_content": message_content,
                 "prd_id": prd_id,
                 "scaffold_id": scaffold_id,
                 "schema_id": schema_id,
@@ -1080,7 +1125,10 @@ def save_to_tester_documents(
                 "tester_id": tester_id,
             })\
             .execute()
-        print("log agent_messages registrado")
+        if files_with_errors_list:
+            print(f"📤 Mensagem enviada para {to_agent} com {len(files_with_errors_list)} arquivos com erro (correção necessária)")
+        else:
+            print(f"📤 Mensagem enviada para {to_agent} (código validado, pronto para deploy)")
     except Exception as log_error:
         print(f"⚠️  Falha ao registrar mensagem em agent_messages: {log_error}")
 
@@ -1131,25 +1179,39 @@ if __name__ == "__main__":
 
         # Buscar codegen a partir da mensagem pendente mais recente enviada pelo codegen_agent
         print("\n📥 Buscando codegen a partir de agent_messages...")
-        codegen_content, codegen_id, prd_id, scaffold_id, schema_id, message_id, artifacts = get_codegen_from_message()
+        codegen_content, codegen_id, prd_id, scaffold_id, schema_id, message_id, artifacts, corrected_files = get_codegen_from_message()
 
         if not codegen_id or not artifacts or not message_id:
             print("no pending messages")
             raise SystemExit(0)
 
+        # Filtrar artifacts se houver lista de arquivos corrigidos
+        original_artifact_count = len(artifacts)
+        if corrected_files and len(corrected_files) > 0:
+            artifacts = [a for a in artifacts if a.get("path", "").strip() in corrected_files]
+            print(f"🧪 Testando apenas arquivos corrigidos: {len(artifacts)} arquivos (de {original_artifact_count} total)")
+        else:
+            print(f"🧪 Testando todos os arquivos (criação inicial): {len(artifacts)} arquivos")
+
         print(f"✅ Codegen encontrado: codegen_id={codegen_id}")
         print(f"   - prd_id: {prd_id}")
         print(f"   - scaffold_id: {scaffold_id}")
-        print(f"   - artifacts: {len(artifacts)} arquivos")
+        print(f"   - artifacts para teste: {len(artifacts)} arquivos")
 
         # Marcar mensagem como em processamento
         try:
-            supabase.table("agent_messages")\
-                .update({"status": "processing"})\
+            result = supabase.table("agent_messages")\
+                .update({"status": "working"})\
                 .eq("id", message_id)\
+                .eq("project_id", PROJECT_ID)\
                 .execute()
+            if result.data:
+                print(f"✅ Mensagem {message_id} marcada como 'working'")
+            else:
+                print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'working'")
         except Exception as exc:
-            print(f"⚠️  Falha ao marcar mensagem como processing: {exc}")
+            print(f"❌ Falha ao marcar mensagem como working: {exc}")
+            raise
 
         # Executar validações
         print("\n🔍 Executando validações...")
@@ -1258,14 +1320,19 @@ if __name__ == "__main__":
         else:
             print(f"\n⚠️  Código não enviado para GitHub devido a erros encontrados (status: {overall_status}, arquivos com erros: {files_with_errors})")
 
-        # Marcar mensagem original como ok
+        # Marcar mensagem original como done
         try:
-            supabase.table("agent_messages")\
-                .update({"status": "ok"})\
+            result = supabase.table("agent_messages")\
+                .update({"status": "done"})\
                 .eq("id", message_id)\
+                .eq("project_id", PROJECT_ID)\
                 .execute()
+            if result.data:
+                print(f"✅ Mensagem {message_id} marcada como 'done'")
+            else:
+                print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'done'")
         except Exception as exc:
-            print(f"⚠️  Falha ao marcar mensagem como ok: {exc}")
+            print(f"❌ Falha ao marcar mensagem como done: {exc}")
 
     except SystemExit:
         raise
@@ -1279,6 +1346,7 @@ if __name__ == "__main__":
                         "message_content": f"tester_error: {str(e)}",
                     })\
                     .eq("id", message_id)\
+                    .eq("project_id", PROJECT_ID)\
                     .execute()
             except Exception as exc:
                 print(f"⚠️  Falha ao marcar mensagem como error: {exc}")

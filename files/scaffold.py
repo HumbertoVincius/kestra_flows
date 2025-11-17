@@ -1020,12 +1020,18 @@ if __name__ == "__main__":
 
         # Marcar mensagem como em processamento
         try:
-            supabase.table("agent_messages")\
-                .update({"status": "processing"})\
+            result = supabase.table("agent_messages")\
+                .update({"status": "working"})\
                 .eq("id", message_id)\
+                .eq("project_id", PROJECT_ID)\
                 .execute()
+            if result.data:
+                print(f"✅ Mensagem {message_id} marcada como 'working'")
+            else:
+                print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'working'")
         except Exception as exc:
-            print(f"⚠️  Falha ao marcar mensagem como processing: {exc}")
+            print(f"❌ Falha ao marcar mensagem como working: {exc}")
+            raise
 
         user_message = build_user_message(prd_text, base_user_msg)
 
@@ -1079,14 +1085,19 @@ if __name__ == "__main__":
         print(f"scaffold salvo com sucesso: {scaffold_tokens} tokens")
         print(f"scaffold_id: {saved_record.get('scaffold_id')}")
 
-        # Marcar mensagem original como ok
+        # Marcar mensagem original como done
         try:
-            supabase.table("agent_messages")\
-                .update({"status": "ok"})\
+            result = supabase.table("agent_messages")\
+                .update({"status": "done"})\
                 .eq("id", message_id)\
+                .eq("project_id", PROJECT_ID)\
                 .execute()
+            if result.data:
+                print(f"✅ Mensagem {message_id} marcada como 'done'")
+            else:
+                print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'done'")
         except Exception as exc:
-            print(f"⚠️  Falha ao marcar mensagem como ok: {exc}")
+            print(f"❌ Falha ao marcar mensagem como done: {exc}")
 
     except SystemExit:
         # Apenas re-levantar para encerrar sem erro adicional
@@ -1101,6 +1112,7 @@ if __name__ == "__main__":
                         "message_content": f"scaffold_error: {str(e)}",
                     })\
                     .eq("id", message_id)\
+                    .eq("project_id", PROJECT_ID)\
                     .execute()
             except Exception as exc:
                 print(f"⚠️  Falha ao marcar mensagem como error: {exc}")
