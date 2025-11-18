@@ -154,6 +154,7 @@ PROJECT_ID = "639e810b-9d8c-4f31-9569-ecf61fb43888"
 SCHEMA_AGENT_NAME = "schema_agent"
 SCAFFOLD_AGENT_NAME = "scaffold_agent"
 CODEGEN_AGENT_NAME = "codegen_agent"
+ANALYZER_AGENT_NAME = "analyzer_agent"
 MESSAGE_CONTENT_CREATED = "schema_created"
 
 
@@ -234,15 +235,44 @@ def _format_scaffold_text(content: Any) -> str:
     return str(content)
 
 
-def get_prd_and_scaffold_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+def get_impact_report(analyzer_id: Optional[str]) -> Optional[dict]:
+    """
+    Busca o relatório de impacto do analyzer.
+    """
+    if not analyzer_id:
+        return None
+    
+    try:
+        response = (
+            supabase.table("analyzer_documents")
+            .select("content")
+            .eq("analyzer_id", analyzer_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"⚠️  Erro ao buscar relatório de impacto: {exc}")
+        return None
+
+    if not response.data:
+        return None
+
+    record = response.data[0]
+    content = record.get("content") or {}
+    impact_report = content.get("impact_report") if isinstance(content, dict) else None
+    
+    return impact_report
+
+
+def get_prd_and_scaffold_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict]]:
     """
     Busca a mensagem pendente mais recente de scaffold_agent -> schema_agent
-    e carrega PRD e Scaffold correspondentes.
+    e carrega PRD e Scaffold correspondentes junto com o relatório de impacto.
     """
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, prd_id, scaffold_id, status")
+            .select("id, prd_id, scaffold_id, analyzer_id, status")
             .eq("project_id", PROJECT_ID)
             .eq("from_agent", SCAFFOLD_AGENT_NAME)
             .eq("to_agent", SCHEMA_AGENT_NAME)
@@ -256,12 +286,13 @@ def get_prd_and_scaffold_from_message() -> Tuple[Optional[str], Optional[str], O
 
     if not response.data:
         # Nenhuma mensagem pendente
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     msg = response.data[0]
     message_id = msg.get("id")
     prd_id = msg.get("prd_id")
     scaffold_id = msg.get("scaffold_id")
+    analyzer_id = msg.get("analyzer_id")
 
     if not message_id or not prd_id or not scaffold_id:
         raise ValueError(
@@ -307,11 +338,16 @@ def get_prd_and_scaffold_from_message() -> Tuple[Optional[str], Optional[str], O
     scaffold_payload = scaffold_content_raw.get("content") if isinstance(scaffold_content_raw, dict) else scaffold_content_raw
     scaffold_text = _format_scaffold_text(scaffold_payload)
 
-    return prd_text, scaffold_text, prd_id, scaffold_id, message_id
+    # Buscar relatório de impacto se analyzer_id estiver disponível
+    impact_report = None
+    if analyzer_id:
+        impact_report = get_impact_report(analyzer_id)
+
+    return prd_text, scaffold_text, prd_id, scaffold_id, message_id, analyzer_id, impact_report
 
 
 # === LLM ===
-def build_user_message(prd_text: str, scaffold_text: str, base_prompt: str) -> str:
+def build_user_message(prd_text: str, scaffold_text: str, base_prompt: str, impact_report: Optional[dict] = None) -> str:
     sections = []
 
     if base_prompt:
@@ -324,6 +360,44 @@ def build_user_message(prd_text: str, scaffold_text: str, base_prompt: str) -> s
     if scaffold_text:
         sections.append("[SCAFFOLD]")
         sections.append(scaffold_text.strip())
+
+    # Incluir relatório de impacto se disponível
+    if impact_report:
+        sections.append("\n[RELATÓRIO DE IMPACTO - SCHEMA]")
+        summary = impact_report.get("summary", {})
+        is_first_cycle = summary.get("is_first_cycle", False)
+        schema_changes = impact_report.get("schema_changes", {})
+        
+        if is_first_cycle:
+            sections.append("Este é o primeiro ciclo. Gere schema completo para todas as tabelas listadas em schema_changes.tables_to_create.")
+        else:
+            sections.append("Gere apenas as mudanças de schema necessárias listadas abaixo.")
+            tables_to_create = schema_changes.get("tables_to_create", [])
+            tables_to_modify = schema_changes.get("tables_to_modify", [])
+            columns_to_add = schema_changes.get("columns_to_add", [])
+            
+            if tables_to_create:
+                sections.append(f"\n[TABELAS A CRIAR: {len(tables_to_create)}]")
+                for table in tables_to_create:
+                    sections.append(f"- {table}")
+            
+            if tables_to_modify:
+                sections.append(f"\n[TABELAS A MODIFICAR: {len(tables_to_modify)}]")
+                for table in tables_to_modify:
+                    sections.append(f"- {table}")
+            
+            if columns_to_add:
+                sections.append(f"\n[COLUNAS A ADICIONAR: {len(columns_to_add)}]")
+                for col_info in columns_to_add:
+                    table = col_info.get("table", "")
+                    column = col_info.get("column", "")
+                    col_type = col_info.get("type", "")
+                    sections.append(f"- {table}.{column} ({col_type})")
+            
+            migration_notes = schema_changes.get("migration_notes", "")
+            if migration_notes:
+                sections.append(f"\n[NOTAS DE MIGRAÇÃO]")
+                sections.append(migration_notes)
 
     return "\n\n".join(sections)
 
@@ -497,7 +571,7 @@ def _parse_schema_content(raw_str: str) -> dict:
     }
 
 
-def save_to_schema_documents(result: dict, prd_id: Optional[str], scaffold_id: Optional[str]) -> dict:
+def save_to_schema_documents(result: dict, prd_id: Optional[str], scaffold_id: Optional[str], analyzer_id: Optional[str] = None) -> dict:
     if not prd_id or not scaffold_id:
         raise ValueError("prd_id e scaffold_id são obrigatórios para registrar schema_documents")
 
@@ -536,6 +610,7 @@ def save_to_schema_documents(result: dict, prd_id: Optional[str], scaffold_id: O
                 "prd_id": prd_id,
                 "scaffold_id": scaffold_id,
                 "schema_id": schema_id,
+                "analyzer_id": analyzer_id,
             })\
             .execute()
         print("log agent_messages (schema_agent → codegen_agent) registrado")
@@ -560,7 +635,7 @@ if __name__ == "__main__":
 
     try:
         # Carregar PRD + Scaffold a partir de mensagem pendente
-        prd_text, scaffold_text, prd_id, scaffold_id, message_id = get_prd_and_scaffold_from_message()
+        prd_text, scaffold_text, prd_id, scaffold_id, message_id, analyzer_id, impact_report = get_prd_and_scaffold_from_message()
 
         if not prd_text or not scaffold_text or not prd_id or not scaffold_id or not message_id:
             print("no pending messages")
@@ -608,7 +683,21 @@ if __name__ == "__main__":
 
         max_tokens_value = CONFIG_MAX_TOKENS if isinstance(CONFIG_MAX_TOKENS, int) else 4000
 
-        user_message = build_user_message(prd_text, scaffold_text, base_user_msg)
+        # Log do relatório de impacto
+        if impact_report:
+            summary = impact_report.get("summary", {})
+            is_first_cycle = summary.get("is_first_cycle", False)
+            schema_changes = impact_report.get("schema_changes", {})
+            tables_to_create = len(schema_changes.get("tables_to_create", []))
+            tables_to_modify = len(schema_changes.get("tables_to_modify", []))
+            print(f"📊 Relatório de impacto encontrado:")
+            print(f"   - Primeiro ciclo: {is_first_cycle}")
+            print(f"   - Tabelas a criar: {tables_to_create}")
+            print(f"   - Tabelas a modificar: {tables_to_modify}")
+        else:
+            print("⚠️  Relatório de impacto não encontrado. Gerando schema completo.")
+
+        user_message = build_user_message(prd_text, scaffold_text, base_user_msg, impact_report)
 
         resultado = call_llm(
             system_message=system_msg,
@@ -623,7 +712,7 @@ if __name__ == "__main__":
         total_tokens = llm_meta["total_tokens"]
         print(f"resposta LLM (schema_agent): {total_tokens} total tokens")
 
-        saved_record = save_to_schema_documents(resultado, prd_id, scaffold_id)
+        saved_record = save_to_schema_documents(resultado, prd_id, scaffold_id, analyzer_id)
         schema_id = saved_record.get("schema_id")
         print(f"schema salvo com sucesso: schema_id={schema_id}")
 

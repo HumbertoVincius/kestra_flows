@@ -160,9 +160,11 @@ supabase_write: Optional[Client] = None
 PROJECT_ID = "639e810b-9d8c-4f31-9569-ecf61fb43888"
 CODEGEN_AGENT_NAME = "codegen_agent"
 TESTER_AGENT_NAME = "tester_agent"
+USER_REPORT_AGENT_NAME = "user_report"
 MESSAGE_CONTENT_CREATED = "codegen_created"
 
 SCAFFOLD_AGENT_NAME = "scaffold_agent"
+ANALYZER_AGENT_NAME = "analyzer_agent"
 
 # === Utilitários de parsing ===
 def _extract_code_fence(raw_str: str) -> str:
@@ -557,15 +559,44 @@ def get_system_message() -> Tuple[str, Optional[str], Optional[str], Optional[st
         raise
 
 
-def get_scaffold_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], list[str]]:
+def get_impact_report(analyzer_id: Optional[str]) -> Optional[dict]:
     """
-    Busca a mensagem mais recente de scaffold_agent -> codegen_agent em agent_messages
-    e retorna o scaffold correspondente junto com prd_id e paths esperados.
+    Busca o relatório de impacto do analyzer.
+    """
+    if not analyzer_id:
+        return None
+    
+    try:
+        response = (
+            supabase.table("analyzer_documents")
+            .select("content")
+            .eq("analyzer_id", analyzer_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"⚠️  Erro ao buscar relatório de impacto: {exc}")
+        return None
+
+    if not response.data:
+        return None
+
+    record = response.data[0]
+    content = record.get("content") or {}
+    impact_report = content.get("impact_report") if isinstance(content, dict) else None
+    
+    return impact_report
+
+
+def get_scaffold_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], list[str], Optional[str], Optional[dict]]:
+    """
+    Busca a mensagem mais recente de schema_agent -> codegen_agent em agent_messages
+    e retorna o scaffold correspondente junto com prd_id, paths esperados e relatório de impacto.
     """
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, scaffold_id, prd_id, schema_id, status")
+            .select("id, scaffold_id, prd_id, schema_id, analyzer_id, status")
             .eq("project_id", PROJECT_ID)
             .eq("from_agent", "schema_agent")
             .eq("to_agent", CODEGEN_AGENT_NAME)
@@ -579,13 +610,14 @@ def get_scaffold_from_message() -> Tuple[Optional[str], Optional[str], Optional[
 
     if not response.data:
         # Nenhuma mensagem pendente para este agente
-        return None, None, None, None, None, []
+        return None, None, None, None, None, [], None, None
 
     msg_record = response.data[0]
     message_id = msg_record.get("id")
     scaffold_id = msg_record.get("scaffold_id")
     prd_id = msg_record.get("prd_id")
     schema_id = msg_record.get("schema_id")
+    analyzer_id = msg_record.get("analyzer_id")
 
     if not message_id or not scaffold_id or not schema_id:
         raise ValueError(
@@ -620,7 +652,12 @@ def get_scaffold_from_message() -> Tuple[Optional[str], Optional[str], Optional[
     text_payload = _format_scaffold_payload(scaffold_payload, raw_output)
     expected_paths = _collect_scaffold_paths(scaffold_payload)
 
-    return text_payload, scaffold_id, prd_id, schema_id, message_id, expected_paths
+    # Buscar relatório de impacto se analyzer_id estiver disponível
+    impact_report = None
+    if analyzer_id:
+        impact_report = get_impact_report(analyzer_id)
+
+    return text_payload, scaffold_id, prd_id, schema_id, message_id, expected_paths, analyzer_id, impact_report
 
 
 def get_prd_text(prd_id: str) -> str:
@@ -678,16 +715,16 @@ def get_schema_summary(schema_id: str) -> str:
 
 def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict], Optional[list]]:
     """
-    Busca a mensagem mais recente de tester_agent -> codegen_agent em agent_messages
-    que indica necessidade de correção. Retorna os IDs necessários, o relatório do tester
+    Busca a mensagem mais recente de tester_agent -> codegen_agent OU user_report -> codegen_agent
+    em agent_messages que indica necessidade de correção. Retorna os IDs necessários, o relatório do tester
     e a lista de arquivos com erro do message_content.
     """
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, codegen_id, prd_id, scaffold_id, schema_id, tester_id, status, message_content")
+            .select("id, codegen_id, prd_id, scaffold_id, schema_id, tester_id, status, message_content, from_agent")
             .eq("project_id", PROJECT_ID)
-            .eq("from_agent", TESTER_AGENT_NAME)
+            .in_("from_agent", [TESTER_AGENT_NAME, USER_REPORT_AGENT_NAME])
             .eq("to_agent", CODEGEN_AGENT_NAME)
             .eq("status", "pending")
             .order("created_at", desc=True)
@@ -695,10 +732,10 @@ def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optio
             .execute()
         )
     except Exception as exc:
-        raise ValueError(f"Erro ao buscar agent_messages do tester_agent: {exc}") from exc
+        raise ValueError(f"Erro ao buscar agent_messages: {exc}") from exc
 
     if not response.data:
-        # Nenhuma mensagem pendente do tester
+        # Nenhuma mensagem pendente do tester ou user_report
         return None, None, None, None, None, None, None, None
 
     msg_record = response.data[0]
@@ -709,12 +746,38 @@ def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optio
     schema_id = msg_record.get("schema_id")
     tester_id = msg_record.get("tester_id")
     message_content = msg_record.get("message_content")
+    from_agent = msg_record.get("from_agent")
 
-    if not message_id or not codegen_id or not tester_id:
+    if not message_id or not codegen_id:
         raise ValueError(
-            "Mensagem do tester encontrada não contém id, codegen_id ou tester_id válido. "
-            "Verifique se o tester_agent está salvando esses campos corretamente."
+            "Mensagem encontrada não contém id ou codegen_id válido."
         )
+    
+    # Se for mensagem manual (user_report), tester_id deve existir (criado pelo script)
+    # Mas vamos tornar mais flexível para compatibilidade
+    if not tester_id:
+        print("⚠️  Mensagem sem tester_id - tentando continuar sem relatório")
+        tester_report = None
+    else:
+        # Buscar relatório do tester
+        try:
+            tester_response = (
+                supabase.table("tester_documents")
+                .select("content")
+                .eq("tester_id", tester_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            raise ValueError(f"Erro ao buscar relatório do tester com tester_id={tester_id}: {exc}") from exc
+
+        if not tester_response.data:
+            print(f"⚠️  Mensagem encontrada (tester_id={tester_id}), mas relatório não encontrado.")
+            tester_report = None
+        else:
+            tester_record = tester_response.data[0]
+            tester_content = tester_record.get("content") or {}
+            tester_report = tester_content.get("report") if isinstance(tester_content, dict) else tester_content
 
     # Extrair files_with_errors do message_content se for JSON estruturado
     files_with_errors = None
@@ -732,26 +795,6 @@ def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optio
         except (json.JSONDecodeError, TypeError):
             # message_content não é JSON, é string simples (sem erros)
             pass
-
-    # Buscar relatório do tester
-    try:
-        tester_response = (
-            supabase.table("tester_documents")
-            .select("content")
-            .eq("tester_id", tester_id)
-            .limit(1)
-            .execute()
-        )
-    except Exception as exc:
-        raise ValueError(f"Erro ao buscar relatório do tester com tester_id={tester_id}: {exc}") from exc
-
-    if not tester_response.data:
-        print(f"⚠️  Mensagem do tester encontrada (tester_id={tester_id}), mas relatório não encontrado. Continuando no modo criação.")
-        return None, None, None, None, None, None, None, None
-
-    tester_record = tester_response.data[0]
-    tester_content = tester_record.get("content") or {}
-    tester_report = tester_content.get("report") if isinstance(tester_content, dict) else tester_content
 
     return message_id, codegen_id, prd_id, scaffold_id, schema_id, tester_id, tester_report, files_with_errors
 
@@ -789,13 +832,95 @@ def get_codegen_artifacts(codegen_id: str) -> List[Dict[str, str]]:
     return artifacts
 
 
+def _validate_react_query_setup(artifacts: List[Dict[str, str]], generated_paths: List[str]) -> None:
+    """
+    Valida se QueryClientProvider está configurado quando há uso de React Query.
+    Detecta uso de useMutation, useQuery ou useQueryClient e verifica se Providers está no layout.
+    """
+    if not artifacts:
+        return
+    
+    # Detectar uso de React Query
+    react_query_hooks = ["useMutation", "useQuery", "useQueryClient"]
+    files_using_react_query = []
+    
+    for artifact in artifacts:
+        path = artifact.get("path", "").strip()
+        content = artifact.get("content", "")
+        
+        if not path or not content:
+            continue
+        
+        # Verificar se o arquivo usa algum hook do React Query
+        for hook in react_query_hooks:
+            if hook in content:
+                files_using_react_query.append(path)
+                break
+    
+    if not files_using_react_query:
+        # Nenhum arquivo usa React Query, não precisa validar
+        return
+    
+    print(f"🔍 Detectado uso de React Query em {len(files_using_react_query)} arquivo(s)")
+    
+    # Verificar se app/providers.tsx existe
+    providers_path = "app/providers.tsx"
+    providers_exists = any(
+        a.get("path", "").strip() == providers_path 
+        for a in artifacts
+    )
+    
+    # Verificar se app/layout.tsx usa Providers e obter conteúdo do providers.tsx
+    layout_path = "app/layout.tsx"
+    layout_uses_providers = False
+    providers_content = None
+    
+    for artifact in artifacts:
+        path = artifact.get("path", "").strip()
+        if path == layout_path:
+            content = artifact.get("content", "")
+            # Verificar se importa Providers e usa no JSX
+            if "Providers" in content and ("<Providers>" in content or "<Providers " in content):
+                layout_uses_providers = True
+        elif path == providers_path:
+            providers_content = artifact.get("content", "")
+    
+    # Verificar se providers.tsx tem QueryClientProvider
+    providers_has_query_client = False
+    if providers_content:
+        if "QueryClientProvider" in providers_content and "QueryClient" in providers_content:
+            providers_has_query_client = True
+    
+    # Reportar problemas
+    issues = []
+    
+    if not providers_exists:
+        issues.append(f"❌ ERRO CRÍTICO: `{providers_path}` não existe, mas há uso de React Query em: {', '.join(files_using_react_query[:3])}")
+        print(f"   ⚠️  Arquivos usando React Query: {files_using_react_query[:5]}")
+    elif not providers_has_query_client:
+        issues.append(f"❌ ERRO CRÍTICO: `{providers_path}` existe mas não contém QueryClientProvider")
+    
+    if not layout_uses_providers:
+        issues.append(f"❌ ERRO CRÍTICO: `{layout_path}` não envolve children com <Providers>, mas há uso de React Query")
+    
+    if issues:
+        print("\n🚨 VALIDAÇÃO FALHOU - QueryClientProvider não configurado corretamente:")
+        for issue in issues:
+            print(f"   {issue}")
+        print("\n   ⚠️  Isso causará erro de runtime: 'No QueryClient set, use QueryClientProvider to set one'")
+        print("   ⚠️  O código gerado precisa ser corrigido antes de ser usado.")
+    else:
+        print("✅ Validação: QueryClientProvider configurado corretamente")
+
+
 def build_correction_message(
     artifacts: List[Dict[str, str]],
     tester_report: dict,
     prd_text: Optional[str],
     schema_text: Optional[str],
     base_prompt: str,
-    files_with_errors: Optional[List[str]] = None
+    files_with_errors: Optional[List[str]] = None,
+    impact_report: Optional[dict] = None
 ) -> str:
     """Constrói mensagem de correção incluindo código atual e erros encontrados."""
     sections = []
@@ -877,6 +1002,18 @@ def build_correction_message(
         sections.append("\n[SCHEMA]")
         sections.append(schema_text.strip())
     
+    # Incluir relatório de impacto se disponível (para contexto de mudanças)
+    if impact_report:
+        sections.append("\n[RELATÓRIO DE IMPACTO - CONTEXTO]")
+        summary = impact_report.get("summary", {})
+        is_first_cycle = summary.get("is_first_cycle", False)
+        if is_first_cycle:
+            sections.append("Este é o primeiro ciclo. Todos os arquivos devem ser criados.")
+        else:
+            files_to_create = len(impact_report.get("files_to_create", []))
+            files_to_modify = len(impact_report.get("files_to_modify", []))
+            sections.append(f"Arquivos impactados pelo PRD: {files_to_create} a criar, {files_to_modify} a modificar")
+    
     sections.append("\n[INSTRUÇÕES CRÍTICAS]")
     sections.append("1. Corrija APENAS os arquivos listados acima que têm erros reportados.")
     sections.append("2. Para arquivos marcados como [OK - MANTER], você NÃO precisa incluí-los na resposta (eles serão mantidos automaticamente).")
@@ -888,7 +1025,7 @@ def build_correction_message(
     return "\n\n".join(sections)
 
 
-def build_user_message(scaffold_text: str, prd_text: Optional[str], schema_text: Optional[str], base_prompt: str, expected_files: Optional[list[str]]) -> str:
+def build_user_message(scaffold_text: str, prd_text: Optional[str], schema_text: Optional[str], base_prompt: str, expected_files: Optional[list[str]], impact_report: Optional[dict] = None) -> str:
     prompt = (base_prompt or "").strip()
     scaffold_section = scaffold_text.strip()
 
@@ -906,6 +1043,58 @@ def build_user_message(scaffold_text: str, prd_text: Optional[str], schema_text:
     sections.append("[SCAFFOLD]")
     if scaffold_section:
         sections.append(scaffold_section)
+
+    # Incluir relatório de impacto se disponível
+    if impact_report:
+        sections.append("\n[RELATÓRIO DE IMPACTO - CODEGEN]")
+        summary = impact_report.get("summary", {})
+        is_first_cycle = summary.get("is_first_cycle", False)
+        
+        if is_first_cycle:
+            sections.append("Este é o primeiro ciclo. Gere código completo para todos os arquivos listados em files_to_create.")
+        else:
+            sections.append("🚨 CRÍTICO: Este NÃO é o primeiro ciclo. Você DEVE gerar código APENAS para os arquivos impactados listados abaixo.")
+            sections.append("NÃO gere código para arquivos que não estão na lista de impactados.")
+            sections.append("NÃO inclua arquivos de configuração a menos que estejam explicitamente listados.")
+            
+            files_to_create = impact_report.get("files_to_create", [])
+            files_to_modify = impact_report.get("files_to_modify", [])
+            files_to_delete = impact_report.get("files_to_delete", [])
+            
+            total_impacted = len(files_to_create) + len(files_to_modify)
+            sections.append(f"\nTotal de arquivos impactados: {len(files_to_create)} criar + {len(files_to_modify)} modificar = {total_impacted} arquivos")
+            sections.append(f"Arquivos a deletar: {len(files_to_delete)}")
+            sections.append(f"\nVocê deve retornar EXATAMENTE {total_impacted} arquivos nos artifacts (apenas os listados abaixo).")
+            
+            if files_to_create:
+                sections.append("\n[ARQUIVOS A CRIAR - GERE CÓDIGO PARA ESTES]")
+                for file_info in files_to_create:
+                    path = file_info.get("path", "")
+                    reason = file_info.get("reason", "")
+                    priority = file_info.get("priority", "")
+                    sections.append(f"- {path}: {reason} (prioridade: {priority})")
+            
+            if files_to_modify:
+                sections.append("\n[ARQUIVOS A MODIFICAR - GERE CÓDIGO PARA ESTES]")
+                for file_info in files_to_modify:
+                    path = file_info.get("path", "")
+                    reason = file_info.get("reason", "")
+                    priority = file_info.get("priority", "")
+                    changes = file_info.get("changes", [])
+                    sections.append(f"- {path}: {reason} (prioridade: {priority})")
+                    if changes:
+                        for change in changes:
+                            sections.append(f"  * {change}")
+            
+            if files_to_delete:
+                sections.append("\n[ARQUIVOS A DELETAR - NÃO GERE CÓDIGO PARA ESTES]")
+                for file_info in files_to_delete:
+                    path = file_info.get("path", "")
+                    reason = file_info.get("reason", "")
+                    sections.append(f"- {path}: {reason}")
+            
+            sections.append("\n[INSTRUÇÃO FINAL]")
+            sections.append(f"Retorne APENAS os {total_impacted} arquivos impactados listados acima. NÃO inclua outros arquivos.")
 
     if expected_files:
         lines = ["[EXPECTED_FILES]", "Liste completa de arquivos que devem ser emitidos exatamente com o conteúdo final:"]
@@ -927,6 +1116,7 @@ def call_llm(
     expected_file_paths: Optional[list[str]] = None,
     mode: str = "criar",
     original_artifacts: Optional[List[Dict[str, str]]] = None,
+    impact_report: Optional[dict] = None,
 ) -> dict:
     if isinstance(model, str):
         model = model.strip() or None
@@ -1096,6 +1286,43 @@ def call_llm(
             if isinstance(path_value, str):
                 generated_paths.append(path_value.strip())
 
+    # Validação baseada no relatório de impacto se disponível
+    # Nota: impact_report é passado como parâmetro da função call_llm
+    if mode == "criar" and impact_report:
+        summary = impact_report.get("summary", {})
+        is_first_cycle = summary.get("is_first_cycle", False)
+        
+        if not is_first_cycle:
+            # Validar que apenas arquivos impactados foram gerados
+            files_to_create = impact_report.get("files_to_create", [])
+            files_to_modify = impact_report.get("files_to_modify", [])
+            
+            expected_impacted_paths = set()
+            for file_info in files_to_create:
+                path = file_info.get("path", "").strip()
+                if path:
+                    expected_impacted_paths.add(path)
+            for file_info in files_to_modify:
+                path = file_info.get("path", "").strip()
+                if path:
+                    expected_impacted_paths.add(path)
+            
+            generated_paths_set = set(generated_paths)
+            
+            # Verificar se há arquivos não impactados
+            unexpected_paths = generated_paths_set - expected_impacted_paths
+            if unexpected_paths:
+                print(f"⚠️  AVISO: Codegen gerou {len(unexpected_paths)} arquivos não impactados: {list(unexpected_paths)[:5]}")
+                print(f"   Esperado apenas {len(expected_impacted_paths)} arquivos impactados")
+            
+            # Verificar se faltam arquivos impactados
+            missing_impacted = expected_impacted_paths - generated_paths_set
+            if missing_impacted:
+                print(f"⚠️  AVISO: Faltam {len(missing_impacted)} arquivos impactados: {list(missing_impacted)[:5]}")
+    
+    # Validação crítica: QueryClientProvider quando há uso de React Query
+    _validate_react_query_setup(artifacts, generated_paths)
+
     if expected_file_paths:
         missing_paths = [path for path in expected_file_paths if path not in set(generated_paths)]
         if missing_paths:
@@ -1135,7 +1362,7 @@ def call_llm(
 
 
 # === Persistência ===
-def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: Optional[str], schema_id: Optional[str], corrected_files: Optional[List[str]] = None) -> dict:
+def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: Optional[str], schema_id: Optional[str], corrected_files: Optional[List[str]] = None, analyzer_id: Optional[str] = None) -> dict:
     if not scaffold_id:
         raise ValueError("scaffold_id inválido: é necessário para registrar codegen_documents")
 
@@ -1188,6 +1415,7 @@ def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: 
                 "scaffold_id": scaffold_id,
                 "schema_id": schema_id,
                 "codegen_id": codegen_id,
+                "analyzer_id": analyzer_id,
             })\
             .execute()
         if corrected_files:
@@ -1515,8 +1743,29 @@ if __name__ == "__main__":
             # Extrair paths esperados dos artifacts
             scaffold_paths = [a.get("path", "") for a in artifacts if a.get("path")]
             
+            # Buscar relatório de impacto se disponível (para contexto)
+            impact_report_correction = None
+            if codegen_id:
+                # Tentar buscar analyzer_id da mensagem original
+                try:
+                    msg_response = (
+                        supabase.table("agent_messages")
+                        .select("analyzer_id")
+                        .eq("project_id", PROJECT_ID)
+                        .eq("codegen_id", codegen_id)
+                        .order("created_at", desc=True)
+                        .limit(1)
+                        .execute()
+                    )
+                    if msg_response.data:
+                        analyzer_id_correction = msg_response.data[0].get("analyzer_id")
+                        if analyzer_id_correction:
+                            impact_report_correction = get_impact_report(analyzer_id_correction)
+                except Exception:
+                    pass
+            
             # Construir mensagem de correção (usar files_with_errors do message_content se disponível)
-            user_message = build_correction_message(artifacts, tester_report, prd_text, schema_text, base_user_msg, files_with_errors)
+            user_message = build_correction_message(artifacts, tester_report, prd_text, schema_text, base_user_msg, files_with_errors, impact_report_correction)
             
             if files_with_errors:
                 print(f"📝 Código a corrigir: {len(files_with_errors)} arquivos com erro (de {len(artifacts)} total)")
@@ -1527,7 +1776,7 @@ if __name__ == "__main__":
         else:
             # Modo criação: buscar mensagem do schema_agent
             print("📝 Modo criação: buscando mensagem do schema_agent")
-            scaffold_text, scaffold_id, prd_id, schema_id, message_id, scaffold_paths = get_scaffold_from_message()
+            scaffold_text, scaffold_id, prd_id, schema_id, message_id, scaffold_paths, analyzer_id, impact_report = get_scaffold_from_message()
 
             if not scaffold_id or not scaffold_text or not schema_id or not message_id:
                 print("no pending messages")
@@ -1550,7 +1799,21 @@ if __name__ == "__main__":
 
             prd_text = get_prd_text(prd_id) if prd_id else ""
             schema_text = get_schema_summary(schema_id) if schema_id else ""
-            user_message = build_user_message(scaffold_text, prd_text, schema_text, base_user_msg, scaffold_paths)
+            
+            # Log do relatório de impacto
+            if impact_report:
+                summary = impact_report.get("summary", {})
+                is_first_cycle = summary.get("is_first_cycle", False)
+                files_to_create = len(impact_report.get("files_to_create", []))
+                files_to_modify = len(impact_report.get("files_to_modify", []))
+                print(f"📊 Relatório de impacto encontrado:")
+                print(f"   - Primeiro ciclo: {is_first_cycle}")
+                print(f"   - Arquivos a criar: {files_to_create}")
+                print(f"   - Arquivos a modificar: {files_to_modify}")
+            else:
+                print("⚠️  Relatório de impacto não encontrado. Gerando código completo.")
+            
+            user_message = build_user_message(scaffold_text, prd_text, schema_text, base_user_msg, scaffold_paths, impact_report)
 
         system_message = CONFIG_SYSTEM_MESSAGE
         ai_model = CONFIG_AI_MODEL
@@ -1593,6 +1856,7 @@ if __name__ == "__main__":
             expected_file_paths=scaffold_paths,
             mode=execution_mode,
             original_artifacts=original_artifacts,
+            impact_report=impact_report if execution_mode == "criar" else None,
         )
 
         llm_meta = resultado["metadata"]
@@ -1601,7 +1865,27 @@ if __name__ == "__main__":
 
         # Extrair lista de arquivos corrigidos do metadata se disponível
         corrected_files = resultado.get("metadata", {}).get("corrected_files")
-        saved_record = save_to_codegen_documents(resultado, scaffold_id, prd_id, schema_id, corrected_files)
+        # Usar analyzer_id do modo criação ou buscar do modo correção
+        current_analyzer_id = None
+        if execution_mode == "criar" and 'analyzer_id' in locals():
+            current_analyzer_id = analyzer_id
+        elif execution_mode == "corrigir" and codegen_id:
+            # Tentar buscar analyzer_id da mensagem original
+            try:
+                msg_response = (
+                    supabase.table("agent_messages")
+                    .select("analyzer_id")
+                    .eq("project_id", PROJECT_ID)
+                    .eq("codegen_id", codegen_id)
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if msg_response.data:
+                    current_analyzer_id = msg_response.data[0].get("analyzer_id")
+            except Exception:
+                pass
+        saved_record = save_to_codegen_documents(resultado, scaffold_id, prd_id, schema_id, corrected_files, current_analyzer_id)
         codegen_tokens = llm_meta.get("codegen_tokens")
         print(f"codegen salvo com sucesso: {codegen_tokens} tokens")
         codegen_id = saved_record.get('codegen_id')

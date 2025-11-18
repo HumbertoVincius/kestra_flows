@@ -155,6 +155,7 @@ CODEGEN_AGENT_NAME = "codegen_agent"
 MESSAGE_CONTENT_CREATED = "scaffold_created"
 
 PRD_AGENT_NAME = "prd_agent"
+ANALYZER_AGENT_NAME = "analyzer_agent"
 SCHEMA_AGENT_NAME = "schema_agent"
 
 
@@ -567,6 +568,56 @@ def _normalize_scaffold_structure(data: Union[list, dict]) -> dict:
     return result
 
 
+def _filter_scaffold_by_impact(scaffold_content: dict, impact_report: dict) -> dict:
+    """
+    Filtra o scaffold para incluir apenas arquivos impactados quando não for primeiro ciclo.
+    """
+    files_to_create = impact_report.get("files_to_create", [])
+    files_to_modify = impact_report.get("files_to_modify", [])
+    
+    # Criar conjunto de paths impactados
+    impacted_paths = set()
+    for file_info in files_to_create:
+        path = file_info.get("path", "").strip()
+        if path:
+            impacted_paths.add(path)
+    for file_info in files_to_modify:
+        path = file_info.get("path", "").strip()
+        if path:
+            impacted_paths.add(path)
+    
+    if not impacted_paths:
+        print("⚠️  Nenhum arquivo impactado encontrado no relatório, retornando scaffold completo")
+        return scaffold_content
+    
+    # Filtrar cada grupo de artifacts
+    filtered_content = {}
+    total_before = 0
+    total_after = 0
+    
+    for key in ARTIFACT_KEYS:
+        items = scaffold_content.get(key, [])
+        if not isinstance(items, list):
+            filtered_content[key] = []
+            continue
+        
+        total_before += len(items)
+        filtered_items = []
+        for item in items:
+            path = item.get("path", "").strip()
+            if path in impacted_paths:
+                filtered_items.append(item)
+                total_after += 1
+            else:
+                print(f"  ⏭️  Removendo arquivo não impactado: {path}")
+        
+        filtered_content[key] = filtered_items
+    
+    print(f"📊 Filtro aplicado: {total_after} arquivos impactados mantidos de {total_before} arquivos gerados")
+    
+    return filtered_content
+
+
 # === LLM Parsing ===
 def parse_scaffold_content(raw: Any, raw_output_str: Optional[str] = None) -> dict:
     """
@@ -711,17 +762,43 @@ def get_system_message() -> Tuple[str, Optional[str], Optional[str], Optional[st
         raise
 
 
-def get_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def get_impact_report_from_analyzer(analyzer_id: str) -> Optional[dict]:
     """
-    Busca a mensagem mais recente de prd_agent -> scaffold_agent em agent_messages
-    e retorna o PRD correspondente.
+    Busca o relatório de impacto do analyzer.
+    """
+    try:
+        response = (
+            supabase.table("analyzer_documents")
+            .select("content")
+            .eq("analyzer_id", analyzer_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"⚠️  Erro ao buscar relatório de impacto: {exc}")
+        return None
+
+    if not response.data:
+        return None
+
+    record = response.data[0]
+    content = record.get("content") or {}
+    impact_report = content.get("impact_report") if isinstance(content, dict) else None
+    
+    return impact_report
+
+
+def get_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict]]:
+    """
+    Busca a mensagem mais recente de analyzer_agent -> scaffold_agent em agent_messages
+    e retorna o PRD correspondente junto com o relatório de impacto.
     """
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, prd_id, status")
+            .select("id, prd_id, analyzer_id, status")
             .eq("project_id", PROJECT_ID)
-            .eq("from_agent", PRD_AGENT_NAME)
+            .eq("from_agent", ANALYZER_AGENT_NAME)
             .eq("to_agent", SCAFFOLD_AGENT_NAME)
             .eq("status", "pending")
             .order("created_at", desc=True)
@@ -733,15 +810,17 @@ def get_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[str]]
 
     if not response.data:
         # Nenhuma mensagem pendente para este agente
-        return None, None, None
+        return None, None, None, None, None
 
     record = response.data[0]
     message_id = record.get("id")
     prd_id = record.get("prd_id")
+    analyzer_id = record.get("analyzer_id")
+    
     if not message_id or not prd_id:
         raise ValueError(
             "Mensagem encontrada em agent_messages não contém id ou prd_id válido. "
-            "Verifique se o prd_agent está salvando prd_id corretamente."
+            "Verifique se o analyzer_agent está salvando prd_id corretamente."
         )
 
     # Buscar PRD correspondente em prd_documents
@@ -765,7 +844,12 @@ def get_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[str]]
     raw_output = content.get("raw_output") if isinstance(content, dict) else None
     prd_string = _format_prd_payload(prd_payload, raw_output)
 
-    return prd_string, prd_id, message_id
+    # Buscar relatório de impacto se analyzer_id estiver disponível
+    impact_report = None
+    if analyzer_id:
+        impact_report = get_impact_report_from_analyzer(analyzer_id)
+
+    return prd_string, prd_id, message_id, analyzer_id, impact_report
 
 
 # === Função principal de chamada LLM ===
@@ -960,6 +1044,25 @@ def save_to_scaffold_documents(result: dict, prd_id: Optional[str]) -> dict:
     scaffold_id = scaffold_record.get("scaffold_id")
 
     try:
+        # Buscar analyzer_id da mensagem anterior se disponível
+        analyzer_id = None
+        try:
+            msg_response = (
+                supabase.table("agent_messages")
+                .select("analyzer_id")
+                .eq("project_id", PROJECT_ID)
+                .eq("from_agent", ANALYZER_AGENT_NAME)
+                .eq("to_agent", SCAFFOLD_AGENT_NAME)
+                .eq("prd_id", prd_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if msg_response.data:
+                analyzer_id = msg_response.data[0].get("analyzer_id")
+        except Exception:
+            pass
+
         write_client.table("agent_messages")\
             .insert({
                 "project_id": PROJECT_ID,
@@ -969,6 +1072,7 @@ def save_to_scaffold_documents(result: dict, prd_id: Optional[str]) -> dict:
                 "message_content": MESSAGE_CONTENT_CREATED,
                 "prd_id": prd_id,
                 "scaffold_id": scaffold_id,
+                "analyzer_id": analyzer_id,
             })\
             .execute()
         print("log agent_messages registrado")
@@ -978,7 +1082,7 @@ def save_to_scaffold_documents(result: dict, prd_id: Optional[str]) -> dict:
     return scaffold_record
 
 
-def build_user_message(prd_text: str, base_prompt: str) -> str:
+def build_user_message(prd_text: str, base_prompt: str, impact_report: Optional[dict] = None) -> str:
     prompt = (base_prompt or "").strip()
     prd_section = prd_text.strip()
 
@@ -988,6 +1092,56 @@ def build_user_message(prd_text: str, base_prompt: str) -> str:
     sections.append("[PRD]")
     if prd_section:
         sections.append(prd_section)
+
+    # Incluir relatório de impacto se disponível
+    if impact_report:
+        sections.append("\n[RELATÓRIO DE IMPACTO]")
+        summary = impact_report.get("summary", {})
+        is_first_cycle = summary.get("is_first_cycle", False)
+        
+        if is_first_cycle:
+            sections.append("Este é o primeiro ciclo. Gere scaffold completo para todos os arquivos listados em files_to_create.")
+        else:
+            sections.append("🚨 CRÍTICO: Este NÃO é o primeiro ciclo. Você DEVE gerar scaffold APENAS para os arquivos impactados listados abaixo.")
+            sections.append("NÃO inclua arquivos de configuração (.gitignore, package.json, tsconfig.json, etc.) a menos que estejam explicitamente listados abaixo.")
+            sections.append("NÃO inclua arquivos que não estão na lista de impactados.")
+            
+            files_to_create = impact_report.get("files_to_create", [])
+            files_to_modify = impact_report.get("files_to_modify", [])
+            files_to_delete = impact_report.get("files_to_delete", [])
+            
+            sections.append(f"\nTotal de arquivos impactados: {len(files_to_create)} criar + {len(files_to_modify)} modificar = {len(files_to_create) + len(files_to_modify)} arquivos")
+            sections.append(f"Arquivos a deletar: {len(files_to_delete)}")
+            
+            if files_to_create:
+                sections.append("\n[ARQUIVOS A CRIAR - GERE SCAFFOLD PARA ESTES]")
+                for file_info in files_to_create:
+                    path = file_info.get("path", "")
+                    reason = file_info.get("reason", "")
+                    priority = file_info.get("priority", "")
+                    sections.append(f"- {path}: {reason} (prioridade: {priority})")
+            
+            if files_to_modify:
+                sections.append("\n[ARQUIVOS A MODIFICAR - GERE SCAFFOLD PARA ESTES]")
+                for file_info in files_to_modify:
+                    path = file_info.get("path", "")
+                    reason = file_info.get("reason", "")
+                    priority = file_info.get("priority", "")
+                    changes = file_info.get("changes", [])
+                    sections.append(f"- {path}: {reason} (prioridade: {priority})")
+                    if changes:
+                        for change in changes:
+                            sections.append(f"  * {change}")
+            
+            if files_to_delete:
+                sections.append("\n[ARQUIVOS A DELETAR - NÃO GERE SCAFFOLD PARA ESTES]")
+                for file_info in files_to_delete:
+                    path = file_info.get("path", "")
+                    reason = file_info.get("reason", "")
+                    sections.append(f"- {path}: {reason}")
+            
+            sections.append("\n[INSTRUÇÃO FINAL]")
+            sections.append(f"Você deve retornar EXATAMENTE {len(files_to_create) + len(files_to_modify)} arquivos no scaffold (apenas os listados acima).")
 
     return "\n\n".join(sections)
 
@@ -1011,8 +1165,8 @@ if __name__ == "__main__":
     message_id: Optional[str] = None
 
     try:
-        # Recupera o PRD a partir da mensagem pendente mais recente enviada pelo prd_agent
-        prd_text, prd_id, message_id = get_prd_from_message()
+        # Recupera o PRD a partir da mensagem pendente mais recente enviada pelo analyzer_agent
+        prd_text, prd_id, message_id, analyzer_id, impact_report = get_prd_from_message()
 
         if not prd_id or not prd_text or not message_id:
             print("no pending messages")
@@ -1033,7 +1187,20 @@ if __name__ == "__main__":
             print(f"❌ Falha ao marcar mensagem como working: {exc}")
             raise
 
-        user_message = build_user_message(prd_text, base_user_msg)
+        # Log do relatório de impacto
+        if impact_report:
+            summary = impact_report.get("summary", {})
+            is_first_cycle = summary.get("is_first_cycle", False)
+            files_to_create = len(impact_report.get("files_to_create", []))
+            files_to_modify = len(impact_report.get("files_to_modify", []))
+            print(f"📊 Relatório de impacto encontrado:")
+            print(f"   - Primeiro ciclo: {is_first_cycle}")
+            print(f"   - Arquivos a criar: {files_to_create}")
+            print(f"   - Arquivos a modificar: {files_to_modify}")
+        else:
+            print("⚠️  Relatório de impacto não encontrado. Gerando scaffold completo.")
+
+        user_message = build_user_message(prd_text, base_user_msg, impact_report)
 
         system_message = CONFIG_SYSTEM_MESSAGE
         ai_model = CONFIG_AI_MODEL
@@ -1079,6 +1246,28 @@ if __name__ == "__main__":
         llm_meta = resultado["metadata"]
         total_tokens = llm_meta["total_tokens"]
         print(f"resposta LLM: {total_tokens} total tokens")
+
+        # Filtrar scaffold baseado no relatório de impacto se não for primeiro ciclo
+        if impact_report:
+            summary = impact_report.get("summary", {})
+            is_first_cycle = summary.get("is_first_cycle", False)
+            
+            if not is_first_cycle:
+                print("🔍 Filtrando scaffold para incluir apenas arquivos impactados...")
+                artifacts_count_before = resultado["metadata"].get("artifacts_count", 0)
+                filtered_content = _filter_scaffold_by_impact(resultado["content"], impact_report)
+                resultado["content"] = filtered_content
+                
+                # Recontar artifacts após filtro
+                filtered_count = 0
+                for key in ARTIFACT_KEYS:
+                    items = filtered_content.get(key, [])
+                    if isinstance(items, list):
+                        filtered_count += len(items)
+                print(f"✅ Scaffold filtrado: {filtered_count} arquivos impactados (de {artifacts_count_before} gerados)")
+                
+                # Atualizar metadata
+                resultado["metadata"]["artifacts_count"] = filtered_count
 
         saved_record = save_to_scaffold_documents(resultado, prd_id)
         scaffold_tokens = llm_meta.get("scaffold_tokens")

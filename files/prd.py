@@ -154,6 +154,7 @@ supabase_write: Client = None
 PROJECT_ID = "639e810b-9d8c-4f31-9569-ecf61fb43888"
 PRD_AGENT_NAME = "prd_agent"
 SCAFFOLD_AGENT_NAME = "scaffold_agent"
+ANALYZER_AGENT_NAME = "analyzer_agent"
 MESSAGE_CONTENT_CREATED = "prd_created"
 
 
@@ -601,7 +602,7 @@ def save_to_prd_documents(result: dict):
                 .insert({
                     "project_id": PROJECT_ID,
                     "from_agent": PRD_AGENT_NAME,
-                    "to_agent": SCAFFOLD_AGENT_NAME,
+                    "to_agent": ANALYZER_AGENT_NAME,
                     "status": "pending",
                     "message_content": MESSAGE_CONTENT_CREATED,
                     "prd_id": prd_id,
