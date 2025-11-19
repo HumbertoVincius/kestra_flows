@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from supabase import Client, create_client
+from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
 
 # === Carregamento de configuração ===
 ENV_PATH = Path(__file__).parent.parent / ".env"
@@ -101,30 +101,7 @@ CONFIG_PRESENCE_PENALTY = CONFIG_PARAMETERS.get("presence_penalty")
 CONFIG_STOP = CONFIG_PARAMETERS.get("stop")
 
 # === Clientes LLM ===
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    if ENV_PATH.exists():
-        env_content = ENV_PATH.read_text(encoding="utf-8-sig")
-        for line in env_content.strip().split("\n"):
-            if line.startswith("OPENAI_API_KEY="):
-                openai_api_key = line.split("=", 1)[1].strip()
-                break
-    if not openai_api_key:
-        raise ValueError("OPENAI_API_KEY não encontrada no arquivo .env")
-
-openai_client = OpenAI(api_key=openai_api_key)
-
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-if anthropic_api_key:
-    try:
-        from anthropic import Anthropic  # type: ignore
-
-        anthropic_client = Anthropic(api_key=anthropic_api_key)
-    except ImportError:  # pragma: no cover
-        anthropic_client = None
-        print("⚠️  Biblioteca 'anthropic' não encontrada; defina provider como openai ou instale o pacote.")
-else:
-    anthropic_client = None
+# Clientes importados de llm_client.py
 
 # === Cliente Supabase ===
 supabase_url = os.getenv("SUPABASE_URL")
@@ -897,82 +874,30 @@ def call_llm(
         print("⚠️  Modelo claude solicitado com provider openai; usando gpt-4o por padrão.")
         model = "gpt-4o"
 
-    if not user_message:
-        raise ValueError("user_message é obrigatório")
-
-    configured_max_tokens = max_tokens
-    if isinstance(CONFIG_MAX_TOKENS, int):
-        configured_max_tokens = CONFIG_MAX_TOKENS
-    elif configured_max_tokens is None:
-        # Aumentado de 1536 para 4000 para evitar truncamento de scaffolds grandes
-        configured_max_tokens = 4000
-
-    temperature_value = CONFIG_TEMPERATURE if CONFIG_TEMPERATURE is not None else 0
-
-    print("chamando LLM")
-    raw_output: Optional[str] = None
-    usage_info = {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-    }
-
-    if provider == "anthropic":
-        if not anthropic_client:
-            raise ValueError("Anthropic não configurado. Defina ANTHROPIC_API_KEY ou ajuste o provider.")
-        response = anthropic_client.messages.create(
-            model=model,
-            system=system_message,
-            max_tokens=configured_max_tokens,
-            temperature=temperature_value,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": user_message}],
-                }
-            ],
-        )
-        raw_output = "".join(part.text for part in response.content if hasattr(part, "text"))
-        usage = getattr(response, "usage", None)
-        if usage:
-            prompt_tokens = getattr(usage, "input_tokens", 0)
-            completion_tokens = getattr(usage, "output_tokens", 0)
-            usage_info = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }
-    else:
-        openai_kwargs = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message},
-            ],
-            "temperature": temperature_value,
-            "max_tokens": configured_max_tokens,
-        }
-        if CONFIG_TOP_P is not None:
-            openai_kwargs["top_p"] = CONFIG_TOP_P
-        if CONFIG_FREQUENCY_PENALTY is not None:
-            openai_kwargs["frequency_penalty"] = CONFIG_FREQUENCY_PENALTY
-        if CONFIG_PRESENCE_PENALTY is not None:
-            openai_kwargs["presence_penalty"] = CONFIG_PRESENCE_PENALTY
-        if CONFIG_STOP is not None:
-            openai_kwargs["stop"] = CONFIG_STOP
-
-        response = openai_client.chat.completions.create(**openai_kwargs)
-        raw_output = response.choices[0].message.content
-        usage = response.usage
-        prompt_tokens = usage.prompt_tokens if usage else 0
-        completion_tokens = usage.completion_tokens if usage else 0
-        total_tokens = usage.total_tokens if usage else (prompt_tokens + completion_tokens)
-        usage_info = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
-
+    result = llm_call_llm(
+        system_message=system_message,
+        user_message=user_message,
+        model=model,
+        provider=provider,
+        system_revision=system_revision,
+        max_tokens=max_tokens,
+        default_max_tokens=4000,  # Aumentado de 1536 para 4000 para evitar truncamento de scaffolds grandes
+        default_temperature=0,
+        agent_name="Scaffold Agent",
+        get_system_message_fn=get_system_message,
+        config_ai_model=CONFIG_AI_MODEL,
+        config_provider=CONFIG_PROVIDER,
+        config_max_tokens=CONFIG_MAX_TOKENS,
+        config_temperature=CONFIG_TEMPERATURE,
+        config_top_p=CONFIG_TOP_P,
+        config_frequency_penalty=CONFIG_FREQUENCY_PENALTY,
+        config_presence_penalty=CONFIG_PRESENCE_PENALTY,
+        config_stop=CONFIG_STOP,
+    )
+    
+    raw_output = result["raw_output"]
+    usage_info = result["metadata"]
+    
     if raw_output is None:
         raise ValueError("Resposta da LLM vazia")
 

@@ -5,8 +5,8 @@ import re
 from copy import deepcopy
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI
 from supabase import create_client, Client
+from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
 from typing import Optional, Tuple, Any, Union, Iterable
 
 # Carrega variáveis de ambiente do arquivo .env na raiz do projeto
@@ -96,32 +96,8 @@ CONFIG_FREQUENCY_PENALTY = CONFIG_PARAMETERS.get("frequency_penalty")
 CONFIG_PRESENCE_PENALTY = CONFIG_PARAMETERS.get("presence_penalty")
 CONFIG_STOP = CONFIG_PARAMETERS.get("stop")
 
-# Inicializa o cliente OpenAI
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    # Tenta ler diretamente do arquivo como fallback
-    if env_path.exists():
-        content = env_path.read_text(encoding='utf-8-sig')  # utf-8-sig remove BOM
-        for line in content.strip().split('\n'):
-            if line.startswith('OPENAI_API_KEY='):
-                api_key = line.split('=', 1)[1].strip()
-                break
-
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY não encontrada no arquivo .env")
-
-openai_client = OpenAI(api_key=api_key)
-
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-if anthropic_api_key:
-    try:
-        from anthropic import Anthropic  # type: ignore
-        anthropic_client = Anthropic(api_key=anthropic_api_key)
-    except ImportError:  # pragma: no cover - pacote pode não estar instalado
-        anthropic_client = None
-        print("⚠️  Biblioteca 'anthropic' não encontrada; defina o provider como openai ou instale o pacote.")
-else:
-    anthropic_client = None
+# === Clientes LLM ===
+# Clientes importados de llm_client.py
 
 # Inicializa o cliente Supabase
 supabase_url = os.getenv("SUPABASE_URL")
@@ -392,132 +368,36 @@ def call_llm(
     provider: Optional[str] = None,
     max_tokens: int = 1536
 ):
-
     try:
-        if isinstance(model, str):
-            model = model.strip() or None
-        if isinstance(provider, str):
-            provider = provider.strip().lower() or None
-
         # Overrides vindos do arquivo de configuração
         if system_message is None:
             system_message = CONFIG_SYSTEM_MESSAGE
         if user_message is None:
             user_message = CONFIG_USER_MESSAGE
-        if model is None:
-            model = CONFIG_AI_MODEL
-        if provider is None:
-            provider = CONFIG_PROVIDER
-
-        need_supabase_lookup = (
-            system_message is None
-            or model is None
-            or provider is None
+        
+        result = llm_call_llm(
+            system_message=system_message,
+            user_message=user_message,
+            model=model or CONFIG_AI_MODEL,
+            provider=provider or CONFIG_PROVIDER,
+            system_revision=system_revision,
+            max_tokens=max_tokens,
+            default_max_tokens=1536,
+            default_temperature=0,
+            agent_name="PRD Agent",
+            get_system_message_fn=get_system_message,
+            config_ai_model=CONFIG_AI_MODEL,
+            config_provider=CONFIG_PROVIDER,
+            config_max_tokens=CONFIG_MAX_TOKENS,
+            config_temperature=CONFIG_TEMPERATURE,
+            config_top_p=CONFIG_TOP_P,
+            config_frequency_penalty=CONFIG_FREQUENCY_PENALTY,
+            config_presence_penalty=CONFIG_PRESENCE_PENALTY,
+            config_stop=CONFIG_STOP,
         )
-
-        fetched_message = fetched_revision = fetched_model = fetched_provider = None
-        if need_supabase_lookup:
-            fetched_message, fetched_revision, fetched_model, fetched_provider = get_system_message()
-
-        if system_message is None:
-            system_message = fetched_message
-        if system_revision is None:
-            system_revision = fetched_revision
-        if model is None:
-            model = fetched_model or "gpt-4o"
-        if provider is None:
-            provider = fetched_provider
-
-        if provider is None:
-            if isinstance(model, str) and model.lower().startswith("claude"):
-                provider = "anthropic"
-            else:
-                provider = CONFIG_PROVIDER or "openai"
-
-        provider = provider.lower()
-
-        if provider == "openai" and isinstance(model, str) and model.lower().startswith("claude"):
-            print("⚠️  Modelo claude solicitado com provider openai; usando gpt-4o por padrão.")
-            model = "gpt-4o"
         
-        if not user_message:
-            raise ValueError("user_message é obrigatório")
-
-        configured_max_tokens = max_tokens
-        if isinstance(CONFIG_MAX_TOKENS, int):
-            configured_max_tokens = CONFIG_MAX_TOKENS
-        elif configured_max_tokens is None:
-            configured_max_tokens = 1536
-
-        temperature_value = 0
-        if CONFIG_TEMPERATURE is not None:
-            temperature_value = CONFIG_TEMPERATURE
-
-        print("chamando LLM")
-        prd_content_raw: Optional[str] = None
-        usage_info = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        }
-        
-        if provider == "anthropic":
-            if not anthropic_client:
-                raise ValueError("Anthropic não configurado. Defina ANTHROPIC_API_KEY ou ajuste o provider.")
-            response = anthropic_client.messages.create(
-                model=model,
-                system=system_message,
-                max_tokens=configured_max_tokens,
-                temperature=temperature_value,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_message}
-                    ]
-                }]
-            )
-            prd_content_raw = "".join(
-                part.text for part in response.content if hasattr(part, "text")
-            )
-            usage = getattr(response, "usage", None)
-            if usage:
-                prompt_tokens = getattr(usage, "input_tokens", 0)
-                completion_tokens = getattr(usage, "output_tokens", 0)
-                usage_info = {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens
-                }
-        else:
-            openai_kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": user_message}
-                ],
-                "temperature": temperature_value,
-                "max_tokens": configured_max_tokens
-            }
-            if CONFIG_TOP_P is not None:
-                openai_kwargs["top_p"] = CONFIG_TOP_P
-            if CONFIG_FREQUENCY_PENALTY is not None:
-                openai_kwargs["frequency_penalty"] = CONFIG_FREQUENCY_PENALTY
-            if CONFIG_PRESENCE_PENALTY is not None:
-                openai_kwargs["presence_penalty"] = CONFIG_PRESENCE_PENALTY
-            if CONFIG_STOP is not None:
-                openai_kwargs["stop"] = CONFIG_STOP
-
-            response = openai_client.chat.completions.create(**openai_kwargs)
-            prd_content_raw = response.choices[0].message.content
-            usage = response.usage
-            prompt_tokens = usage.prompt_tokens if usage else 0
-            completion_tokens = usage.completion_tokens if usage else 0
-            total_tokens = usage.total_tokens if usage else (prompt_tokens + completion_tokens)
-            usage_info = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens
-            }
+        prd_content_raw = result["raw_output"]
+        usage_info = result["metadata"]
         
         if prd_content_raw is None:
             raise ValueError("Resposta da LLM vazia")
@@ -542,11 +422,11 @@ def call_llm(
 
         # Monta o JSON de metadados
         metadata = {
-            "prompt_tokens": usage_info["prompt_tokens"],
-            "completion_tokens": usage_info["completion_tokens"],
-            "total_tokens": usage_info["total_tokens"],
-            "agent_model": model,
-            "provider": provider,
+            "prompt_tokens": usage_info.get("prompt_tokens", 0),
+            "completion_tokens": usage_info.get("completion_tokens", 0),
+            "total_tokens": usage_info.get("total_tokens", 0),
+            "agent_model": usage_info.get("agent_model", model),
+            "provider": usage_info.get("provider", provider),
             "prd_tokens": prd_tokens,
             "artifact_count": artifact_count,
             "artifact_characters": artifact_characters,

@@ -3,4 +3,5 @@ python-dotenv>=1.0.0
 supabase>=2.0.0
 anthropic>=0.26.0
 PyGithub>=2.0.0
+google-generativeai>=0.3.0
 
