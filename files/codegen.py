@@ -3,6 +3,7 @@ import json
 import ast
 import re
 import base64
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union, List, Dict
@@ -10,6 +11,7 @@ from typing import Any, Iterable, Optional, Tuple, Union, List, Dict
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
+from logger import init_logger, log_agent_start, log_agent_end, log_llm_call, log_llm_response, log_parse_error, log_parse_success, log_save_document, log_exception, log_info, log_error, log_warning
 
 try:
     from github import Github, GithubException, Auth
@@ -693,15 +695,15 @@ def get_schema_summary(schema_id: str) -> str:
 def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict], Optional[list]]:
     """
     Busca a mensagem mais recente de tester_agent -> codegen_agent OU user_report -> codegen_agent
-    em agent_messages que indica necessidade de correção. Retorna os IDs necessários, o relatório do tester
-    e a lista de arquivos com erro do message_content.
+    OU analyzer_agent -> codegen_agent (modo error_correction) em agent_messages que indica necessidade de correção.
+    Retorna os IDs necessários, o relatório do tester (ou impact_report do analyzer) e a lista de arquivos com erro.
     """
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, codegen_id, prd_id, scaffold_id, schema_id, tester_id, status, message_content, from_agent")
+            .select("id, codegen_id, prd_id, scaffold_id, schema_id, tester_id, analyzer_id, status, message_content, from_agent")
             .eq("project_id", PROJECT_ID)
-            .in_("from_agent", [TESTER_AGENT_NAME, USER_REPORT_AGENT_NAME])
+            .in_("from_agent", [TESTER_AGENT_NAME, USER_REPORT_AGENT_NAME, ANALYZER_AGENT_NAME])
             .eq("to_agent", CODEGEN_AGENT_NAME)
             .eq("status", "pending")
             .order("created_at", desc=True)
@@ -712,7 +714,7 @@ def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optio
         raise ValueError(f"Erro ao buscar agent_messages: {exc}") from exc
 
     if not response.data:
-        # Nenhuma mensagem pendente do tester ou user_report
+        # Nenhuma mensagem pendente do tester, user_report ou analyzer
         return None, None, None, None, None, None, None, None
 
     msg_record = response.data[0]
@@ -722,6 +724,7 @@ def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optio
     scaffold_id = msg_record.get("scaffold_id")
     schema_id = msg_record.get("schema_id")
     tester_id = msg_record.get("tester_id")
+    analyzer_id = msg_record.get("analyzer_id")
     message_content = msg_record.get("message_content")
     from_agent = msg_record.get("from_agent")
 
@@ -730,48 +733,102 @@ def get_tester_correction_message() -> Tuple[Optional[str], Optional[str], Optio
             "Mensagem encontrada não contém id ou codegen_id válido."
         )
     
-    # Se for mensagem manual (user_report), tester_id deve existir (criado pelo script)
-    # Mas vamos tornar mais flexível para compatibilidade
-    if not tester_id:
-        print("⚠️  Mensagem sem tester_id - tentando continuar sem relatório")
-        tester_report = None
+    # Verificar se é mensagem do analyzer_agent (modo error_correction)
+    tester_report = None
+    files_with_errors = None
+    
+    if from_agent == ANALYZER_AGENT_NAME:
+        # Mensagem do analyzer_agent para correção de erro
+        print("🔧 Mensagem de correção de erro do analyzer_agent detectada")
+        
+        # Verificar se message_content indica error_correction
+        if message_content:
+            try:
+                if isinstance(message_content, str):
+                    content_parsed = json.loads(message_content)
+                else:
+                    content_parsed = message_content
+                
+                if isinstance(content_parsed, dict) and content_parsed.get("type") == "error_correction":
+                    # Buscar impact_report do analyzer
+                    if analyzer_id:
+                        try:
+                            analyzer_response = (
+                                supabase.table("analyzer_documents")
+                                .select("content")
+                                .eq("analyzer_id", analyzer_id)
+                                .limit(1)
+                                .execute()
+                            )
+                            if analyzer_response.data:
+                                analyzer_record = analyzer_response.data[0]
+                                analyzer_content = analyzer_record.get("content") or {}
+                                impact_report = analyzer_content.get("impact_report") if isinstance(analyzer_content, dict) else None
+                                
+                                # Criar um relatório simulado baseado no impact_report para compatibilidade
+                                if impact_report:
+                                    files_to_modify = impact_report.get("files_to_modify", [])
+                                    files_with_errors = [f.get("path") for f in files_to_modify if isinstance(f, dict) and f.get("path")]
+                                    
+                                    # Criar relatório simulado no formato esperado
+                                    tester_report = {
+                                        "status": "error",
+                                        "summary": impact_report.get("summary", {}).get("summary_text", "Erro reportado pelo usuário"),
+                                        "errors": [
+                                            {
+                                                "file": f.get("path", ""),
+                                                "reason": f.get("reason", ""),
+                                                "changes": f.get("changes", [])
+                                            }
+                                            for f in files_to_modify if isinstance(f, dict)
+                                        ]
+                                    }
+                                    print(f"📋 Impact report do analyzer: {len(files_with_errors)} arquivos a modificar")
+                        except Exception as exc:
+                            print(f"⚠️  Erro ao buscar impact_report do analyzer: {exc}")
+            except (json.JSONDecodeError, TypeError):
+                pass
     else:
-        # Buscar relatório do tester
-        try:
-            tester_response = (
-                supabase.table("tester_documents")
-                .select("content")
-                .eq("tester_id", tester_id)
-                .limit(1)
-                .execute()
-            )
-        except Exception as exc:
-            raise ValueError(f"Erro ao buscar relatório do tester com tester_id={tester_id}: {exc}") from exc
-
-        if not tester_response.data:
-            print(f"⚠️  Mensagem encontrada (tester_id={tester_id}), mas relatório não encontrado.")
+        # Mensagem do tester ou user_report (lógica original)
+        if not tester_id:
+            print("⚠️  Mensagem sem tester_id - tentando continuar sem relatório")
             tester_report = None
         else:
-            tester_record = tester_response.data[0]
-            tester_content = tester_record.get("content") or {}
-            tester_report = tester_content.get("report") if isinstance(tester_content, dict) else tester_content
+            # Buscar relatório do tester
+            try:
+                tester_response = (
+                    supabase.table("tester_documents")
+                    .select("content")
+                    .eq("tester_id", tester_id)
+                    .limit(1)
+                    .execute()
+                )
+            except Exception as exc:
+                raise ValueError(f"Erro ao buscar relatório do tester com tester_id={tester_id}: {exc}") from exc
 
-    # Extrair files_with_errors do message_content se for JSON estruturado
-    files_with_errors = None
-    if message_content:
-        try:
-            if isinstance(message_content, str):
-                content_parsed = json.loads(message_content)
+            if not tester_response.data:
+                print(f"⚠️  Mensagem encontrada (tester_id={tester_id}), mas relatório não encontrado.")
+                tester_report = None
             else:
-                content_parsed = message_content
-            
-            if isinstance(content_parsed, dict) and content_parsed.get("type") == "correction_request":
-                files_with_errors = content_parsed.get("files_with_errors", [])
-                if files_with_errors:
-                    print(f"📋 Arquivos com erro identificados no message_content: {len(files_with_errors)} arquivos")
-        except (json.JSONDecodeError, TypeError):
-            # message_content não é JSON, é string simples (sem erros)
-            pass
+                tester_record = tester_response.data[0]
+                tester_content = tester_record.get("content") or {}
+                tester_report = tester_content.get("report") if isinstance(tester_content, dict) else tester_content
+
+        # Extrair files_with_errors do message_content se for JSON estruturado
+        if message_content:
+            try:
+                if isinstance(message_content, str):
+                    content_parsed = json.loads(message_content)
+                else:
+                    content_parsed = message_content
+                
+                if isinstance(content_parsed, dict) and content_parsed.get("type") == "correction_request":
+                    files_with_errors = content_parsed.get("files_with_errors", [])
+                    if files_with_errors:
+                        print(f"📋 Arquivos com erro identificados no message_content: {len(files_with_errors)} arquivos")
+            except (json.JSONDecodeError, TypeError):
+                # message_content não é JSON, é string simples (sem erros)
+                pass
 
     return message_id, codegen_id, prd_id, scaffold_id, schema_id, tester_id, tester_report, files_with_errors
 
@@ -1132,10 +1189,24 @@ def call_llm(
         model = "gpt-4o"
 
     # Log do modo de execução
+    start_time = time.time()
+    model_used = model or "unknown"
+    provider_used = provider or "unknown"
+    
     if mode == "corrigir":
         print("🔧 Chamando LLM para corrigir código")
+        log_llm_call(
+            "Chamando LLM para corrigir código",
+            model_used,
+            provider_used
+        )
     else:
         print("📝 Chamando LLM para criar código")
+        log_llm_call(
+            "Chamando LLM para criar código",
+            model_used,
+            provider_used
+        )
     
     result = llm_call_llm(
         system_message=system_message,
@@ -1166,8 +1237,29 @@ def call_llm(
 
     raw_output_str = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, ensure_ascii=False)
     print(f"📦 Raw output recebido: {len(raw_output_str)} caracteres")
+    
+    # Logar resposta LLM
+    execution_time_ms = int((time.time() - start_time) * 1000)
+    log_llm_response(
+        f"Resposta LLM recebida para codegen (modo: {mode})",
+        model_used,
+        provider_used,
+        tokens_used=usage_info.get("total_tokens"),
+        raw_response=raw_output_str[:5000],
+        execution_time_ms=execution_time_ms
+    )
 
-    normalized_content = parse_codegen_content(raw_output)
+    # Parse com logging
+    try:
+        normalized_content = parse_codegen_content(raw_output)
+        log_parse_success(f"Codegen parseado com sucesso (modo: {mode})", parsed_size=len(str(normalized_content)))
+    except ValueError as parse_err:
+        log_parse_error(
+            f"Erro ao parsear codegen (modo: {mode})",
+            str(parse_err),
+            raw_data=raw_output_str[:10000]
+        )
+        raise
     corrected_artifacts = normalized_content.get("artifacts") or []
     corrected_count = len(corrected_artifacts) if isinstance(corrected_artifacts, list) else 0
     print(f"✅ Artifacts corrigidos retornados: {corrected_count}")
@@ -1289,9 +1381,10 @@ def call_llm(
 
 
 # === Persistência ===
-def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: Optional[str], schema_id: Optional[str], corrected_files: Optional[List[str]] = None, analyzer_id: Optional[str] = None) -> dict:
-    if not scaffold_id:
-        raise ValueError("scaffold_id inválido: é necessário para registrar codegen_documents")
+def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: Optional[str], schema_id: Optional[str], corrected_files: Optional[List[str]] = None, analyzer_id: Optional[str] = None, is_error_correction: bool = False) -> dict:
+    # Em modo de correção de erro (vindo do analyzer), scaffold_id, prd_id e schema_id podem ser None
+    if not is_error_correction and not scaffold_id:
+        raise ValueError("scaffold_id inválido: é necessário para registrar codegen_documents (exceto em modo erro)")
 
     content_jsonb = {
         "metadata": result.get("metadata"),
@@ -1300,6 +1393,7 @@ def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: 
         "scaffold_id": scaffold_id,
         "prd_id": prd_id,
         "schema_id": schema_id,
+        "is_error_correction": is_error_correction,
     }
 
     is_using_service = supabase_service_key is not None and supabase_service_key.strip() != ""
@@ -1307,11 +1401,17 @@ def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: 
 
     insert_payload = {
         "project_id": PROJECT_ID,
-        "scaffold_id": scaffold_id,
-        "prd_id": prd_id,
-        "schema_id": schema_id,
         "content": content_jsonb,
     }
+    
+    # Apenas incluir scaffold_id, prd_id e schema_id se não forem None
+    # (em modo erro, esses campos podem ser None e a tabela pode ter constraint NOT NULL)
+    if scaffold_id is not None:
+        insert_payload["scaffold_id"] = scaffold_id
+    if prd_id is not None:
+        insert_payload["prd_id"] = prd_id
+    if schema_id is not None:
+        insert_payload["schema_id"] = schema_id
 
     response = write_client.table("codegen_documents").insert(insert_payload).execute()
 
@@ -1320,6 +1420,18 @@ def save_to_codegen_documents(result: dict, scaffold_id: Optional[str], prd_id: 
 
     codegen_record = response.data[0]
     codegen_id = codegen_record.get("codegen_id")
+    
+    # Logar salvamento
+    log_save_document(
+        "Codegen salvo com sucesso",
+        "codegen",
+        document_id=codegen_id,
+        codegen_id=codegen_id,
+        scaffold_id=scaffold_id,
+        prd_id=prd_id,
+        schema_id=schema_id,
+        analyzer_id=analyzer_id
+    )
 
     # Criar message_content: JSON estruturado se houver arquivos corrigidos, string simples se não houver
     if corrected_files and len(corrected_files) > 0:
@@ -1449,11 +1561,16 @@ def push_codegen_to_github(repo, artifacts: List[Dict[str, str]], prd_id: Option
     """
     if not GITHUB_AVAILABLE:
         print("⚠️  PyGithub não está disponível. Pulando push para GitHub.")
+        log_warning("github_push", "PyGithub não disponível, pulando push", codegen_id=codegen_id)
         return False
     
     if not artifacts or len(artifacts) == 0:
         print("⚠️  Nenhum artifact para fazer push")
+        log_warning("github_push", "Nenhum artifact para fazer push", codegen_id=codegen_id)
         return False
+    
+    log_info("github_push", f"Iniciando push para GitHub ({len(artifacts)} arquivos)", codegen_id=codegen_id, prd_id=prd_id)
+    start_time = time.time()
     
     try:
         # Determinar branch padrão (main ou master)
@@ -1613,6 +1730,7 @@ def push_codegen_to_github(repo, artifacts: List[Dict[str, str]], prd_id: Option
         print(f"❌ {error_msg}")
         if hasattr(e, 'data'):
             print(f"   Detalhes: {e.data}")
+        log_error("github_push", error_msg, details={"status": e.status, "data": str(e.data) if hasattr(e, 'data') else None}, codegen_id=codegen_id)
         return False
     except Exception as e:
         import traceback
@@ -1620,10 +1738,16 @@ def push_codegen_to_github(repo, artifacts: List[Dict[str, str]], prd_id: Option
         print(f"❌ Erro inesperado ao fazer push para GitHub: {e}")
         print(f"   Tipo: {type(e).__name__}")
         print(f"   Detalhes: {error_details}")
+        log_exception("github_push", "Erro inesperado ao fazer push para GitHub", e, codegen_id=codegen_id)
         return False
 
 
 if __name__ == "__main__":
+    # Inicializar logger
+    init_logger(CODEGEN_AGENT_NAME, CONFIG_PARAMETERS)
+    agent_start_time = time.time()
+    log_agent_start("Iniciando execução do Codegen Agent")
+    
     base_user_msg = CONFIG_USER_MESSAGE
     if not base_user_msg:
         raise ValueError(
@@ -1639,10 +1763,34 @@ if __name__ == "__main__":
         execution_mode = "criar"
         scaffold_paths = []
         original_artifacts = None  # Para mesclagem no modo correção
+        from_agent_correction = None  # Inicializar variável para rastrear origem da correção
         
-        if tester_msg_id and codegen_id and tester_report:
-            # Modo correção: há mensagem do tester pedindo correção
-            print("🔧 Modo correção: mensagem do tester encontrada")
+        if tester_msg_id and codegen_id:
+            # Modo correção: há mensagem do tester, user_report ou analyzer pedindo correção
+            # Verificar origem da mensagem
+            try:
+                msg_check = (
+                    supabase.table("agent_messages")
+                    .select("from_agent, analyzer_id")
+                    .eq("id", tester_msg_id)
+                    .eq("project_id", PROJECT_ID)
+                    .limit(1)
+                    .execute()
+                )
+                if msg_check.data:
+                    from_agent_correction = msg_check.data[0].get("from_agent")
+                else:
+                    from_agent_correction = None
+                
+                if from_agent_correction == ANALYZER_AGENT_NAME:
+                    print("🔧 Modo correção: mensagem do analyzer_agent encontrada (erro reportado pelo usuário)")
+                elif from_agent_correction == USER_REPORT_AGENT_NAME:
+                    print("🔧 Modo correção: mensagem do user_report encontrada")
+                else:
+                    print("🔧 Modo correção: mensagem do tester encontrada")
+            except Exception:
+                print("🔧 Modo correção: mensagem de correção encontrada")
+            
             message_id = tester_msg_id
             execution_mode = "corrigir"
             
@@ -1672,7 +1820,26 @@ if __name__ == "__main__":
             
             # Buscar relatório de impacto se disponível (para contexto)
             impact_report_correction = None
-            if codegen_id:
+            analyzer_id_correction = None
+            
+            # Se for mensagem do analyzer, buscar analyzer_id diretamente da mensagem
+            if from_agent_correction == ANALYZER_AGENT_NAME:
+                try:
+                    msg_analyzer = (
+                        supabase.table("agent_messages")
+                        .select("analyzer_id")
+                        .eq("id", message_id)
+                        .eq("project_id", PROJECT_ID)
+                        .limit(1)
+                        .execute()
+                    )
+                    if msg_analyzer.data:
+                        analyzer_id_correction = msg_analyzer.data[0].get("analyzer_id")
+                        if analyzer_id_correction:
+                            impact_report_correction = get_impact_report(analyzer_id_correction)
+                except Exception:
+                    pass
+            elif codegen_id:
                 # Tentar buscar analyzer_id da mensagem original
                 try:
                     msg_response = (
@@ -1692,6 +1859,7 @@ if __name__ == "__main__":
                     pass
             
             # Construir mensagem de correção (usar files_with_errors do message_content se disponível)
+            # Se for mensagem do analyzer, tester_report pode ser None (já foi convertido em impact_report)
             user_message = build_correction_message(artifacts, tester_report, prd_text, schema_text, base_user_msg, files_with_errors, impact_report_correction)
             
             if files_with_errors:
@@ -1699,7 +1867,10 @@ if __name__ == "__main__":
             else:
                 print(f"📝 Código a corrigir: {len(artifacts)} arquivos")
             print(f"   - codegen_id: {codegen_id}")
-            print(f"   - tester_id: {tester_id}")
+            if tester_id:
+                print(f"   - tester_id: {tester_id}")
+            if analyzer_id_correction:
+                print(f"   - analyzer_id: {analyzer_id_correction}")
         else:
             # Modo criação: buscar mensagem do schema_agent
             print("📝 Modo criação: buscando mensagem do schema_agent")
@@ -1707,6 +1878,8 @@ if __name__ == "__main__":
 
             if not scaffold_id or not scaffold_text or not schema_id or not message_id:
                 print("no pending messages")
+                execution_time_ms = int((time.time() - agent_start_time) * 1000)
+                log_agent_end("Execução do Codegen Agent concluída (sem mensagens pendentes)", execution_time_ms=execution_time_ms)
                 raise SystemExit(0)
 
             # Marcar mensagem como em processamento
@@ -1812,11 +1985,17 @@ if __name__ == "__main__":
                     current_analyzer_id = msg_response.data[0].get("analyzer_id")
             except Exception:
                 pass
-        saved_record = save_to_codegen_documents(resultado, scaffold_id, prd_id, schema_id, corrected_files, current_analyzer_id)
+        # Determinar se é modo de correção de erro (vindo do analyzer)
+        is_error_correction_mode = execution_mode == "corrigir" and from_agent_correction == ANALYZER_AGENT_NAME
+        saved_record = save_to_codegen_documents(resultado, scaffold_id, prd_id, schema_id, corrected_files, current_analyzer_id, is_error_correction=is_error_correction_mode)
         codegen_tokens = llm_meta.get("codegen_tokens")
         print(f"codegen salvo com sucesso: {codegen_tokens} tokens")
         codegen_id = saved_record.get('codegen_id')
         print(f"codegen_id: {codegen_id}")
+        
+        # Logar fim da execução
+        execution_time_ms = int((time.time() - agent_start_time) * 1000)
+        log_agent_end("Execução do Codegen Agent concluída com sucesso", execution_time_ms=execution_time_ms, codegen_id=codegen_id, prd_id=prd_id, scaffold_id=scaffold_id, schema_id=schema_id)
 
         # Marcar mensagem original como done
         try:
@@ -1835,6 +2014,7 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
+        log_exception("error", "Erro na execução do codegen_agent", e, message_id=message_id)
         print(f"❌ Erro na execução do codegen_agent: {e}")
         if message_id:
             try:

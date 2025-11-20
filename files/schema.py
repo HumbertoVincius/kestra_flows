@@ -1,11 +1,13 @@
 import os
 import json
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
+from logger import init_logger, log_agent_start, log_agent_end, log_llm_call, log_llm_response, log_parse_error, log_parse_success, log_save_document, log_exception, log_info
 
 
 # === Caminhos e configuração ===
@@ -423,6 +425,16 @@ def call_llm(
         print("⚠️  Modelo claude solicitado com provider openai; usando gpt-4o por padrão.")
         model = "gpt-4o"
 
+    start_time = time.time()
+    model_used = model or "unknown"
+    provider_used = provider or "unknown"
+    
+    log_llm_call(
+        "Chamando LLM para gerar schema",
+        model_used,
+        provider_used
+    )
+
     result = llm_call_llm(
         system_message=system_message,
         user_message=user_message,
@@ -452,8 +464,29 @@ def call_llm(
 
     raw_str = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, ensure_ascii=False)
     print(f"📦 Raw output (schema_agent): {len(raw_str)} caracteres")
+    
+    # Logar resposta LLM
+    execution_time_ms = int((time.time() - start_time) * 1000)
+    log_llm_response(
+        "Resposta LLM recebida para schema",
+        model_used,
+        provider_used,
+        tokens_used=usage_info.get("total_tokens"),
+        raw_response=raw_str[:5000],
+        execution_time_ms=execution_time_ms
+    )
 
-    parsed = _parse_schema_content(raw_str)
+    # Parse com logging
+    try:
+        parsed = _parse_schema_content(raw_str)
+        log_parse_success("Schema parseado com sucesso", parsed_size=len(str(parsed)))
+    except ValueError as parse_err:
+        log_parse_error(
+            "Erro ao parsear schema",
+            str(parse_err),
+            raw_data=raw_str[:10000]
+        )
+        raise
 
     metadata = {
         "prompt_tokens": usage_info["prompt_tokens"],
@@ -547,6 +580,11 @@ def save_to_schema_documents(result: dict, prd_id: Optional[str], scaffold_id: O
 
 
 if __name__ == "__main__":
+    # Inicializar logger
+    init_logger(SCHEMA_AGENT_NAME, CONFIG_PARAMETERS)
+    agent_start_time = time.time()
+    log_agent_start("Iniciando execução do Schema Agent")
+    
     base_user_msg = CONFIG_USER_MESSAGE
     if not base_user_msg:
         raise ValueError(
@@ -640,6 +678,10 @@ if __name__ == "__main__":
 
         saved_record = save_to_schema_documents(resultado, prd_id, scaffold_id, analyzer_id)
         schema_id = saved_record.get("schema_id")
+        
+        # Logar fim da execução
+        execution_time_ms = int((time.time() - agent_start_time) * 1000)
+        log_agent_end("Execução do Schema Agent concluída com sucesso", execution_time_ms=execution_time_ms, schema_id=schema_id, prd_id=prd_id, scaffold_id=scaffold_id)
         print(f"schema salvo com sucesso: schema_id={schema_id}")
 
         # Marcar mensagem original como done
@@ -659,6 +701,7 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
+        log_exception("error", "Erro na execução do schema_agent", e, message_id=message_id)
         print(f"❌ Erro na execução do schema_agent: {e}")
         if message_id:
             try:

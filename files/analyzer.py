@@ -1,12 +1,14 @@
 import os
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union, List, Dict
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
+from logger import init_logger, log_agent_start, log_agent_end, log_llm_call, log_llm_response, log_parse_error, log_parse_success, log_save_document, log_exception, log_info, log_error
 
 # === Caminhos e configuração ===
 ENV_PATH = Path(__file__).parent.parent / ".env"
@@ -184,7 +186,7 @@ def get_new_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
     try:
         response = (
             supabase.table("agent_messages")
-            .select("id, prd_id, status")
+            .select("id, prd_id, status, message_content")
             .eq("project_id", PROJECT_ID)
             .eq("from_agent", PRD_AGENT_NAME)
             .eq("to_agent", ANALYZER_AGENT_NAME)
@@ -202,6 +204,21 @@ def get_new_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
     record = response.data[0]
     message_id = record.get("id")
     new_prd_id = record.get("prd_id")
+    message_content = record.get("message_content")
+    
+    # Verificar se é mensagem de erro (não PRD)
+    if message_content:
+        try:
+            if isinstance(message_content, str):
+                content_parsed = json.loads(message_content)
+            else:
+                content_parsed = message_content
+            
+            if isinstance(content_parsed, dict) and content_parsed.get("type") == "error_report":
+                # Esta é uma mensagem de erro, não PRD
+                return None, None, None
+        except (json.JSONDecodeError, TypeError):
+            pass
     
     if not message_id or not new_prd_id:
         raise ValueError(
@@ -240,6 +257,58 @@ def get_new_prd_from_message() -> Tuple[Optional[str], Optional[str], Optional[s
         prd_text = str(prd_payload) if prd_payload else ""
 
     return prd_text, new_prd_id, message_id
+
+
+def get_error_from_message() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Busca a mensagem mais recente de prd_agent -> analyzer_agent em agent_messages
+    que contém um relatório de erro (não PRD).
+    Retorna (error_text, codegen_id, message_id) ou (None, None, None) se não houver.
+    """
+    try:
+        response = (
+            supabase.table("agent_messages")
+            .select("id, codegen_id, status, message_content")
+            .eq("project_id", PROJECT_ID)
+            .eq("from_agent", PRD_AGENT_NAME)
+            .eq("to_agent", ANALYZER_AGENT_NAME)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise ValueError(f"Erro ao buscar agent_messages para analyzer_agent: {exc}") from exc
+
+    if not response.data:
+        return None, None, None
+
+    record = response.data[0]
+    message_id = record.get("id")
+    codegen_id = record.get("codegen_id")
+    message_content = record.get("message_content")
+    
+    if not message_id or not message_content:
+        return None, None, None
+    
+    # Verificar se é mensagem de erro
+    try:
+        if isinstance(message_content, str):
+            content_parsed = json.loads(message_content)
+        else:
+            content_parsed = message_content
+        
+        if isinstance(content_parsed, dict) and content_parsed.get("type") == "error_report":
+            error_text = content_parsed.get("error_text", "")
+            # Usar codegen_id da mensagem ou do content
+            codegen_id = codegen_id or content_parsed.get("codegen_id")
+            
+            if error_text and codegen_id:
+                return error_text, codegen_id, message_id
+    except (json.JSONDecodeError, TypeError):
+        pass
+    
+    return None, None, None
 
 
 def get_previous_prd_for_comparison(new_prd_id: str) -> Tuple[Optional[str], Optional[str]]:
@@ -389,6 +458,49 @@ def build_user_message(
     return "\n".join(sections)
 
 
+def build_error_message(
+    error_text: str,
+    current_code_artifacts: List[Dict[str, str]],
+    base_prompt: str
+) -> str:
+    """Constrói mensagem do usuário para LLM quando entrada é erro (ao invés de PRD)."""
+    sections = []
+    
+    if base_prompt:
+        sections.append(base_prompt.strip())
+    
+    sections.append("[ERRO REPORTADO]")
+    sections.append("O usuário reportou um erro/bug no código. Analise o erro abaixo e identifique quais arquivos precisam ser corrigidos.")
+    sections.append("\n" + error_text.strip())
+    
+    if current_code_artifacts:
+        sections.append("\n[CÓDIGO ATUAL]")
+        sections.append(f"Lista de {len(current_code_artifacts)} arquivos do código atual:")
+        sections.append("Analise o erro em relação ao código atual para identificar arquivos afetados.")
+        # Limitar para não exceder tokens - mostrar primeiros 20 arquivos
+        for artifact in current_code_artifacts[:20]:
+            path = artifact.get("path", "")
+            content_preview = artifact.get("content", "")[:500]  # Primeiros 500 chars
+            sections.append(f"\n--- Arquivo: {path} ---")
+            sections.append(content_preview)
+            if len(artifact.get("content", "")) > 500:
+                sections.append("... (conteúdo truncado)")
+        if len(current_code_artifacts) > 20:
+            sections.append(f"\n... e mais {len(current_code_artifacts) - 20} arquivos")
+    else:
+        sections.append("\n[CÓDIGO ATUAL]")
+        sections.append("Nenhum código gerado ainda. Este erro não pode ser analisado sem código existente.")
+    
+    sections.append("\n[INSTRUÇÕES]")
+    sections.append("Este é um relatório de ERRO, não um PRD novo. Foque em:")
+    sections.append("- Identificar arquivos que precisam ser CORRIGIDOS (files_to_modify)")
+    sections.append("- NÃO criar novos arquivos (files_to_create deve estar vazio ou mínimo)")
+    sections.append("- Identificar a causa raiz do erro")
+    sections.append("- Listar dependências que podem estar faltando ou incorretas")
+    
+    return "\n".join(sections)
+
+
 def _extract_code_fence(raw_str: str) -> str:
     """Extrai conteúdo de code fence se presente."""
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_str, re.IGNORECASE)
@@ -476,6 +588,16 @@ def call_llm(
     system_revision: Optional[str] = None,
     max_tokens: int = 8000,
 ) -> dict:
+    start_time = time.time()
+    model_used = model or CONFIG_AI_MODEL or "unknown"
+    provider_used = provider or CONFIG_PROVIDER or "unknown"
+    
+    log_llm_call(
+        "Chamando LLM para gerar relatório de impacto",
+        model_used,
+        provider_used
+    )
+    
     result = llm_call_llm(
         system_message=system_message,
         user_message=user_message,
@@ -501,7 +623,34 @@ def call_llm(
     raw_str = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, ensure_ascii=False)
     print(f"📦 Raw output (analyzer_agent): {len(raw_str)} caracteres")
     
-    parsed = _parse_impact_report(raw_str)
+    # Logar resposta
+    log_llm_response(
+        "Resposta LLM recebida para relatório de impacto",
+        model_used,
+        provider_used,
+        tokens_used=result["metadata"].get("total_tokens"),
+        raw_response=raw_str[:5000]
+    )
+    
+    # Parse com logging
+    try:
+        parsed = _parse_impact_report(raw_str)
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        log_parse_success("Relatório de impacto parseado com sucesso", parsed_size=len(str(parsed)))
+        log_llm_response(
+            "Relatório de impacto gerado com sucesso",
+            model_used,
+            provider_used,
+            tokens_used=result["metadata"].get("total_tokens"),
+            execution_time_ms=execution_time_ms
+        )
+    except ValueError as parse_err:
+        log_parse_error(
+            "Erro ao parsear relatório de impacto",
+            str(parse_err),
+            raw_data=raw_str[:10000]
+        )
+        raise
     
     return {
         "content": parsed,
@@ -513,10 +662,13 @@ def call_llm(
 def save_to_analyzer_documents(
     result: dict,
     new_prd_id: Optional[str],
-    old_prd_id: Optional[str] = None
+    old_prd_id: Optional[str] = None,
+    error_text: Optional[str] = None,
+    codegen_id: Optional[str] = None,
+    is_error_correction: bool = False
 ) -> dict:
-    if not new_prd_id:
-        raise ValueError("new_prd_id inválido: é necessário para registrar analyzer_documents")
+    if not is_error_correction and not new_prd_id:
+        raise ValueError("new_prd_id inválido: é necessário para registrar analyzer_documents (exceto em modo erro)")
 
     content_jsonb = {
         "metadata": result.get("metadata"),
@@ -524,17 +676,30 @@ def save_to_analyzer_documents(
         "raw_output": result.get("raw_output"),
         "new_prd_id": new_prd_id,
         "old_prd_id": old_prd_id,
+        "is_error_correction": is_error_correction,
     }
+    
+    if error_text:
+        content_jsonb["error_text"] = error_text
+        content_jsonb["error_source"] = "prd_agent"
+    
+    if codegen_id:
+        content_jsonb["codegen_id"] = codegen_id
 
     is_using_service = supabase_service_key is not None and supabase_service_key.strip() != ""
     write_client = create_client(supabase_url, supabase_service_key) if is_using_service else supabase
 
     insert_payload = {
         "project_id": PROJECT_ID,
-        "new_prd_id": new_prd_id,
-        "old_prd_id": old_prd_id,
         "content": content_jsonb,
     }
+    
+    # Apenas incluir new_prd_id e old_prd_id se não forem None
+    # (em modo erro, new_prd_id pode ser None e a tabela pode ter constraint NOT NULL)
+    if new_prd_id is not None:
+        insert_payload["new_prd_id"] = new_prd_id
+    if old_prd_id is not None:
+        insert_payload["old_prd_id"] = old_prd_id
 
     response = write_client.table("analyzer_documents").insert(insert_payload).execute()
     if not response.data:
@@ -542,20 +707,51 @@ def save_to_analyzer_documents(
 
     analyzer_record = response.data[0]
     analyzer_id = analyzer_record.get("analyzer_id")
+    
+    # Logar salvamento
+    log_save_document(
+        "Relatório de impacto salvo com sucesso",
+        "analyzer",
+        document_id=analyzer_id,
+        analyzer_id=analyzer_id,
+        prd_id=new_prd_id,
+        codegen_id=codegen_id
+    )
 
     try:
-        write_client.table("agent_messages")\
-            .insert({
-                "project_id": PROJECT_ID,
-                "from_agent": ANALYZER_AGENT_NAME,
-                "to_agent": SCAFFOLD_AGENT_NAME,
-                "status": "pending",
-                "message_content": MESSAGE_CONTENT_CREATED,
-                "prd_id": new_prd_id,
+        # Se for correção de erro, enviar direto para codegen (pulando scaffold/schema)
+        if is_error_correction:
+            message_content = json.dumps({
+                "type": "error_correction",
                 "analyzer_id": analyzer_id,
-            })\
-            .execute()
-        print("log agent_messages (analyzer_agent → scaffold_agent) registrado")
+            }, ensure_ascii=False)
+            
+            write_client.table("agent_messages")\
+                .insert({
+                    "project_id": PROJECT_ID,
+                    "from_agent": ANALYZER_AGENT_NAME,
+                    "to_agent": "codegen_agent",
+                    "status": "pending",
+                    "message_content": message_content,
+                    "codegen_id": codegen_id,
+                    "analyzer_id": analyzer_id,
+                })\
+                .execute()
+            print("log agent_messages (analyzer_agent → codegen_agent) registrado (modo correção de erro)")
+        else:
+            # Fluxo normal: analyzer → scaffold
+            write_client.table("agent_messages")\
+                .insert({
+                    "project_id": PROJECT_ID,
+                    "from_agent": ANALYZER_AGENT_NAME,
+                    "to_agent": SCAFFOLD_AGENT_NAME,
+                    "status": "pending",
+                    "message_content": MESSAGE_CONTENT_CREATED,
+                    "prd_id": new_prd_id,
+                    "analyzer_id": analyzer_id,
+                })\
+                .execute()
+            print("log agent_messages (analyzer_agent → scaffold_agent) registrado")
     except Exception as log_error:
         print(f"⚠️  Falha ao registrar mensagem em agent_messages: {log_error}")
 
@@ -563,6 +759,11 @@ def save_to_analyzer_documents(
 
 
 if __name__ == "__main__":
+    # Inicializar logger
+    init_logger(ANALYZER_AGENT_NAME, CONFIG_PARAMETERS)
+    agent_start_time = time.time()
+    log_agent_start("Iniciando execução do Analyzer Agent")
+    
     base_user_msg = CONFIG_USER_MESSAGE
     if not base_user_msg:
         raise ValueError(
@@ -576,11 +777,141 @@ if __name__ == "__main__":
     message_id: Optional[str] = None
 
     try:
+        # Primeiro verificar se há mensagem de erro (prioridade sobre PRD)
+        error_text, codegen_id, error_message_id = get_error_from_message()
+        
+        if error_text and codegen_id and error_message_id:
+            # Modo correção de erro
+            print("🐛 Modo correção de erro detectado")
+            message_id = error_message_id
+            
+            # Marcar mensagem como working
+            try:
+                result = supabase.table("agent_messages")\
+                    .update({"status": "working"})\
+                    .eq("id", message_id)\
+                    .eq("project_id", PROJECT_ID)\
+                    .execute()
+                if result.data:
+                    print(f"✅ Mensagem {message_id} marcada como 'working' (modo erro)")
+                else:
+                    print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'working'")
+            except Exception as exc:
+                print(f"❌ Falha ao marcar mensagem como working: {exc}")
+                raise
+            
+            # Buscar código atual do codegen
+            print("📥 Buscando código atual do codegen...")
+            current_code_artifacts = get_latest_codegen_artifacts()
+            print(f"📦 Código atual: {len(current_code_artifacts)} arquivos encontrados")
+            
+            if not current_code_artifacts:
+                print("⚠️  Nenhum código encontrado. Não é possível analisar erro sem código.")
+                raise ValueError("Código atual não encontrado para análise de erro")
+            
+            # Completar config a partir do Supabase, se necessário
+            if system_msg is None or ai_model is None or provider is None:
+                fetched_msg, fetched_rev, fetched_model, fetched_provider = get_system_message()
+                if system_msg is None:
+                    system_msg = fetched_msg
+                system_rev = fetched_rev
+                if ai_model is None:
+                    ai_model = fetched_model
+                if provider is None:
+                    provider = fetched_provider
+
+            if system_msg is None:
+                raise ValueError("System message não encontrado. Configure em analyzer_config.json ou no Supabase.")
+
+            if ai_model is None:
+                ai_model = "gpt-4o"
+
+            if provider is None:
+                provider = "openai"
+
+            print("Parâmetros efetivos da execução (analyzer_agent - modo erro):")
+            print(f" - model: {ai_model}")
+            print(f" - provider: {provider}")
+            print(f" - notes: {CONFIG_PARAMETERS.get('notes') or '<não informado>'}")
+
+            # Usar system message específico para análise de erros se disponível
+            error_system_msg_raw = ANALYZER_CONFIG.get("error_analysis_system_message")
+            if error_system_msg_raw:
+                error_system_msg = _serialize_payload(error_system_msg_raw)
+                if error_system_msg:
+                    system_msg = error_system_msg
+                    print("📝 Usando system message específico para análise de erros")
+
+            max_tokens_value = CONFIG_MAX_TOKENS if isinstance(CONFIG_MAX_TOKENS, int) else 8000
+
+            # Construir mensagem para análise de erro
+            error_user_msg = ANALYZER_CONFIG.get("error_analysis_user_message") or base_user_msg
+            user_message = build_error_message(error_text, current_code_artifacts, error_user_msg)
+
+            print("\n🤖 Gerando relatório de impacto para correção de erro via LLM...")
+            resultado = call_llm(
+                system_message=system_msg,
+                user_message=user_message,
+                model=ai_model,
+                provider=provider,
+                system_revision=system_rev,
+                max_tokens=max_tokens_value,
+            )
+
+            llm_meta = resultado["metadata"]
+            total_tokens = llm_meta["total_tokens"]
+            print(f"✅ Relatório gerado: {total_tokens} total tokens")
+
+            # Extrair resumo do relatório
+            impact_report = resultado.get("content", {}).get("impact_report", {})
+            summary = impact_report.get("summary", {})
+            overall_impact = summary.get("overall_impact", "unknown")
+            files_to_modify = len(impact_report.get("files_to_modify", []))
+
+            print(f"\n📊 Resumo do impacto (correção de erro):")
+            print(f"   - Impacto geral: {overall_impact}")
+            print(f"   - Arquivos a modificar: {files_to_modify}")
+
+            # Salvar no banco
+            print("\n💾 Salvando relatório no Supabase...")
+            saved_record = save_to_analyzer_documents(
+                resultado, 
+                new_prd_id=None, 
+                old_prd_id=None,
+                error_text=error_text,
+                codegen_id=codegen_id,
+                is_error_correction=True
+            )
+            analyzer_id = saved_record.get("analyzer_id")
+            print(f"✅ Relatório salvo com sucesso: analyzer_id={analyzer_id}")
+
+            # Marcar mensagem original como done
+            try:
+                result = supabase.table("agent_messages")\
+                    .update({"status": "done"})\
+                    .eq("id", message_id)\
+                    .eq("project_id", PROJECT_ID)\
+                    .execute()
+                if result.data:
+                    print(f"✅ Mensagem {message_id} marcada como 'done'")
+                else:
+                    print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'done'")
+            except Exception as exc:
+                print(f"❌ Falha ao marcar mensagem como done: {exc}")
+            
+            # Encerrar após processar erro
+            execution_time_ms = int((time.time() - agent_start_time) * 1000)
+            log_agent_end("Execução do Analyzer Agent concluída (modo erro)", execution_time_ms=execution_time_ms, analyzer_id=analyzer_id, codegen_id=codegen_id)
+            raise SystemExit(0)
+        
+        # Se não for erro, processar como PRD normalmente
         # Buscar novo PRD a partir de mensagem pendente
         new_prd_text, new_prd_id, message_id = get_new_prd_from_message()
 
         if not new_prd_id or not new_prd_text or not message_id:
             print("no pending messages")
+            execution_time_ms = int((time.time() - agent_start_time) * 1000)
+            log_agent_end("Execução do Analyzer Agent concluída (sem mensagens pendentes)", execution_time_ms=execution_time_ms)
             raise SystemExit(0)
 
         # Marcar mensagem como working
@@ -709,10 +1040,16 @@ if __name__ == "__main__":
                 print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'done'")
         except Exception as exc:
             print(f"❌ Falha ao marcar mensagem como done: {exc}")
+            log_exception("error", "Erro ao marcar mensagem como done", exc, message_id=message_id)
+        
+        # Logar fim da execução
+        execution_time_ms = int((time.time() - agent_start_time) * 1000)
+        log_agent_end("Execução do Analyzer Agent concluída com sucesso", execution_time_ms=execution_time_ms, analyzer_id=analyzer_id, prd_id=new_prd_id)
 
     except SystemExit:
         raise
     except Exception as e:
+        log_exception("error", "Erro na execução do analyzer_agent", e, message_id=message_id)
         print(f"❌ Erro na execução do analyzer_agent: {e}")
         if message_id:
             try:

@@ -4,12 +4,14 @@ import subprocess
 import tempfile
 import shutil
 import base64
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union, List, Dict
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
+from logger import init_logger, log_agent_start, log_agent_end, log_llm_call, log_llm_response, log_parse_error, log_parse_success, log_save_document, log_exception, log_info, log_error, log_warning
 
 try:
     from github import Github, GithubException, Auth
@@ -523,6 +525,16 @@ def call_llm(
         print("⚠️  Modelo claude solicitado com provider openai; usando gpt-4o por padrão.")
         model = "gpt-4o"
 
+    start_time = time.time()
+    model_used = model or "unknown"
+    provider_used = provider or "unknown"
+    
+    log_llm_call(
+        "Chamando LLM para gerar relatório de validação",
+        model_used,
+        provider_used
+    )
+
     try:
         result = llm_call_llm(
             system_message=system_message,
@@ -551,8 +563,29 @@ def call_llm(
         if raw_output is None:
             raise ValueError("Resposta da LLM vazia")
 
+        # Logar resposta LLM
+        raw_output_str = str(raw_output) if not isinstance(raw_output, str) else raw_output
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        log_llm_response(
+            "Resposta LLM recebida para relatório de validação",
+            model_used,
+            provider_used,
+            tokens_used=usage_info.get("total_tokens"),
+            raw_response=raw_output_str[:5000],
+            execution_time_ms=execution_time_ms
+        )
+
         # Parse do relatório
-        parsed_report = parse_test_report(raw_output)
+        try:
+            parsed_report = parse_test_report(raw_output)
+            log_parse_success("Relatório de validação parseado com sucesso", parsed_size=len(str(parsed_report)))
+        except ValueError as parse_err:
+            log_parse_error(
+                "Erro ao parsear relatório de validação",
+                str(parse_err),
+                raw_data=raw_output_str[:10000]
+            )
+            raise
 
         # Metadados
         metadata = {
@@ -571,6 +604,7 @@ def call_llm(
         }
 
     except Exception as e:
+        log_exception("error", "Erro ao chamar LLM para relatório de validação", e)
         print(f"Erro ao chamar a LLM: {e}")
         raise
 
@@ -1007,6 +1041,18 @@ def save_to_tester_documents(
 
     tester_record = response.data[0]
     tester_id = tester_record.get("tester_id")
+    
+    # Logar salvamento
+    log_save_document(
+        "Relatório de validação salvo com sucesso",
+        "tester",
+        document_id=tester_id,
+        tester_id=tester_id,
+        codegen_id=codegen_id,
+        prd_id=prd_id,
+        scaffold_id=scaffold_id,
+        schema_id=schema_id
+    )
 
     # Extrair arquivos com erro do relatório para message_content
     report = result.get("content", {}).get("report", {})
@@ -1051,15 +1097,24 @@ def save_to_tester_documents(
             .execute()
         if files_with_errors_list:
             print(f"📤 Mensagem enviada para {to_agent} com {len(files_with_errors_list)} arquivos com erro (correção necessária)")
+            log_info("message_sent", f"Mensagem enviada para {to_agent} com {len(files_with_errors_list)} arquivos com erro", 
+                    details={"files_with_errors": len(files_with_errors_list)}, tester_id=tester_id, codegen_id=codegen_id)
         else:
             print(f"📤 Mensagem enviada para {to_agent} (código validado, pronto para deploy)")
+            log_info("message_sent", f"Mensagem enviada para {to_agent} (código validado)", tester_id=tester_id, codegen_id=codegen_id)
     except Exception as log_error:
         print(f"⚠️  Falha ao registrar mensagem em agent_messages: {log_error}")
+        log_exception("error", "Erro ao registrar mensagem em agent_messages", log_error, tester_id=tester_id)
 
     return tester_record
 
 
 if __name__ == "__main__":
+    # Inicializar logger
+    init_logger(TESTER_AGENT_NAME, CONFIG_PARAMETERS)
+    agent_start_time = time.time()
+    log_agent_start("Iniciando execução do Tester Agent")
+    
     # Carregar configuração
     user_msg = CONFIG_USER_MESSAGE
     system_msg = CONFIG_SYSTEM_MESSAGE
@@ -1146,12 +1201,20 @@ if __name__ == "__main__":
             temp_dir = Path(temp_dir_str)
             
             print("  - Executando ESLint...")
+            eslint_start = time.time()
             eslint_output = run_eslint(artifacts, temp_dir)
+            eslint_time_ms = int((time.time() - eslint_start) * 1000)
             print(f"    ESLint concluído (output: {len(eslint_output)} chars)")
+            log_info("validation", f"ESLint executado ({len(eslint_output)} chars de output)", 
+                    details={"output_length": len(eslint_output)}, execution_time_ms=eslint_time_ms, codegen_id=codegen_id)
 
             print("  - Executando build...")
+            build_start = time.time()
             build_output = run_build(artifacts, temp_dir)
+            build_time_ms = int((time.time() - build_start) * 1000)
             print(f"    Build concluído (output: {len(build_output)} chars)")
+            log_info("validation", f"Build executado ({len(build_output)} chars de output)", 
+                    details={"output_length": len(build_output)}, execution_time_ms=build_time_ms, codegen_id=codegen_id)
 
         # Construir mensagem do usuário (incluindo schema, se disponível)
         schema_text = get_schema_summary(schema_id) if schema_id else ""
@@ -1257,10 +1320,17 @@ if __name__ == "__main__":
                 print(f"⚠️  Nenhuma linha atualizada ao marcar mensagem {message_id} como 'done'")
         except Exception as exc:
             print(f"❌ Falha ao marcar mensagem como done: {exc}")
+            log_exception("error", "Erro ao marcar mensagem como done", exc, message_id=message_id)
+        
+        # Logar fim da execução
+        execution_time_ms = int((time.time() - agent_start_time) * 1000)
+        log_agent_end("Execução do Tester Agent concluída com sucesso", execution_time_ms=execution_time_ms, 
+                     tester_id=tester_id, codegen_id=codegen_id, prd_id=prd_id)
 
     except SystemExit:
         raise
     except Exception as e:
+        log_exception("error", "Erro na execução do tester_agent", e, message_id=message_id)
         print(f"❌ Erro na execução do tester_agent: {e}")
         if message_id:
             try:

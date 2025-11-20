@@ -2,12 +2,14 @@ import os
 import json
 import ast
 import re
+import time
 from copy import deepcopy
 from pathlib import Path
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
 from typing import Optional, Tuple, Any, Union, Iterable
+from logger import init_logger, log_agent_start, log_agent_end, log_llm_call, log_llm_response, log_parse_error, log_parse_success, log_save_document, log_exception, log_info, log_error
 
 # Carrega variáveis de ambiente do arquivo .env na raiz do projeto
 env_path = Path(__file__).parent.parent / '.env'
@@ -180,6 +182,166 @@ def get_system_message() -> Tuple[str, str, Optional[str], Optional[str]]:
     except Exception as e:
         print(f"Erro ao buscar system message do Supabase: {e}")
         raise
+
+
+def get_latest_codegen_id() -> Optional[str]:
+    """
+    Busca o ID do último codegen gerado para o projeto.
+    """
+    try:
+        response = (
+            supabase.table("codegen_documents")
+            .select("codegen_id")
+            .eq("project_id", PROJECT_ID)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        
+        if response.data:
+            return response.data[0].get("codegen_id")
+    except Exception as exc:
+        print(f"⚠️  Erro ao buscar último codegen: {exc}")
+    
+    return None
+
+
+def detect_input_type(user_input: str) -> str:
+    """
+    Detecta se o input do usuário é um PRD (modificação incremental) ou um erro/bug reportado.
+    Usa heurísticas simples primeiro, depois LLM leve se necessário.
+    
+    Returns:
+        "prd" ou "error"
+    """
+    if not user_input or not user_input.strip():
+        return "prd"  # Default para PRD se vazio
+    
+    input_lower = user_input.lower()
+    
+    # Heurísticas simples para detectar erros
+    error_patterns = [
+        r'\berror\b',
+        r'\bexception\b',
+        r'\bthrow\b',
+        r'\bfailed\b',
+        r'\bfailure\b',
+        r'\bbug\b',
+        r'\berro\b',
+        r'\bfalha\b',
+        r'at\s+\w+\.\w+',  # Stack trace pattern: "at Class.method"
+        r'\.tsx?:\d+:\d+',  # File:line:column pattern
+        r'\.jsx?:\d+:\d+',
+        r'TypeError',
+        r'ReferenceError',
+        r'SyntaxError',
+        r'Cannot find',
+        r'is not defined',
+        r'is not exported',
+        r'Module not found',
+        r'stack trace',
+        r'traceback',
+    ]
+    
+    # Verificar padrões de erro
+    for pattern in error_patterns:
+        if re.search(pattern, input_lower, re.IGNORECASE):
+            print(f"🔍 Detectado padrão de erro: {pattern}")
+            return "error"
+    
+    # Se não encontrou padrões claros, usar LLM leve para classificar
+    print("🔍 Padrões não conclusivos, usando LLM para classificar...")
+    
+    classification_prompt = f"""Analise o seguinte input do usuário e classifique como:
+- "prd" se for uma solicitação de modificação incremental, novo requisito ou feature
+- "error" se for um relatório de bug, erro de runtime, stack trace ou problema técnico
+
+Input:
+{user_input[:1000]}
+
+Responda APENAS com "prd" ou "error", sem explicações."""
+
+    try:
+        # Usar LLM rápido e barato para classificação
+        result = llm_call_llm(
+            system_message="Você é um classificador de inputs. Analise e responda apenas com 'prd' ou 'error'.",
+            user_message=classification_prompt,
+            model="gpt-4o-mini",  # Modelo mais barato para classificação
+            provider="openai",
+            max_tokens=10,
+            default_max_tokens=10,
+            default_temperature=0,
+            agent_name="PRD Classifier",
+        )
+        
+        classification = result["raw_output"].strip().lower()
+        if "error" in classification:
+            return "error"
+        else:
+            return "prd"
+    except Exception as exc:
+        print(f"⚠️  Erro ao classificar com LLM: {exc}. Assumindo PRD por padrão.")
+        return "prd"
+
+
+def create_error_message_for_analyzer(error_text: str, codegen_id: Optional[str] = None) -> bool:
+    """
+    Cria uma mensagem em agent_messages para o Analyzer Agent processar um erro reportado.
+    
+    Args:
+        error_text: Texto do erro reportado pelo usuário
+        codegen_id: ID do codegen mais recente (se None, busca automaticamente)
+    
+    Returns:
+        True se sucesso, False caso contrário
+    """
+    print("🔧 Criando mensagem de erro para Analyzer Agent...")
+    
+    # Buscar codegen_id se não fornecido
+    if not codegen_id:
+        codegen_id = get_latest_codegen_id()
+        if not codegen_id:
+            print("❌ ERRO: Nenhum codegen encontrado. Execute o codegen primeiro.")
+            return False
+        print(f"📦 Usando último codegen: {codegen_id}")
+    
+    # Criar message_content estruturado
+    message_content = json.dumps({
+        "type": "error_report",
+        "error_text": error_text[:5000],  # Limitar tamanho
+        "codegen_id": codegen_id,
+        "source": "prd_agent"
+    }, ensure_ascii=False)
+    
+    # Verificar se há service key para escrita
+    is_using_service_key = supabase_service_key is not None and supabase_service_key.strip() != ""
+    write_client = create_client(supabase_url, supabase_service_key) if is_using_service_key else supabase
+    
+    try:
+        msg_doc = {
+            "project_id": PROJECT_ID,
+            "from_agent": PRD_AGENT_NAME,
+            "to_agent": ANALYZER_AGENT_NAME,
+            "status": "pending",
+            "message_content": message_content,
+            "codegen_id": codegen_id,
+        }
+        
+        result = write_client.table("agent_messages").insert(msg_doc).execute()
+        
+        if result.data:
+            print(f"✅ Mensagem de erro criada com sucesso!")
+            print(f"   - Message ID: {result.data[0].get('id')}")
+            print(f"   - Codegen ID: {codegen_id}")
+            print(f"\n📝 Próximo passo: Execute o analyzer para processar o erro.")
+            return True
+        else:
+            print("❌ Erro: Mensagem não foi criada")
+            return False
+            
+    except Exception as exc:
+        print(f"❌ Erro ao criar mensagem de erro: {exc}")
+        return False
 
 
 def _extract_code_fence(raw_str: str) -> str:
@@ -368,12 +530,23 @@ def call_llm(
     provider: Optional[str] = None,
     max_tokens: int = 1536
 ):
+    start_time = time.time()
     try:
         # Overrides vindos do arquivo de configuração
         if system_message is None:
             system_message = CONFIG_SYSTEM_MESSAGE
         if user_message is None:
             user_message = CONFIG_USER_MESSAGE
+        
+        model_used = model or CONFIG_AI_MODEL or "unknown"
+        provider_used = provider or CONFIG_PROVIDER or "unknown"
+        
+        # Logar chamada LLM
+        log_llm_call(
+            "Chamando LLM para gerar PRD",
+            model_used,
+            provider_used
+        )
         
         result = llm_call_llm(
             system_message=system_message,
@@ -402,8 +575,28 @@ def call_llm(
         if prd_content_raw is None:
             raise ValueError("Resposta da LLM vazia")
         
+        # Logar resposta LLM
+        model_used = model or CONFIG_AI_MODEL or "unknown"
+        provider_used = provider or CONFIG_PROVIDER or "unknown"
+        log_llm_response(
+            "Resposta LLM recebida para PRD",
+            model_used,
+            provider_used,
+            tokens_used=usage_info.get("total_tokens"),
+            raw_response=str(prd_content_raw)[:5000] if isinstance(prd_content_raw, str) else str(prd_content_raw)[:5000]
+        )
+        
         # Normaliza o conteúdo antes de prosseguir
-        normalized_content = parse_prd_content(prd_content_raw)
+        try:
+            normalized_content = parse_prd_content(prd_content_raw)
+            log_parse_success("PRD parseado com sucesso", parsed_size=len(str(normalized_content)))
+        except ValueError as parse_err:
+            log_parse_error(
+                "Erro ao parsear resposta PRD",
+                str(parse_err),
+                raw_data=str(prd_content_raw)[:10000] if isinstance(prd_content_raw, str) else str(prd_content_raw)[:10000]
+            )
+            raise
         
         # Estima o tamanho do PRD em tokens (aproximação: 1 token ≈ 4 caracteres)
         content_estimate_source = prd_content_raw if isinstance(prd_content_raw, str) else json.dumps(prd_content_raw)
@@ -432,6 +625,18 @@ def call_llm(
             "artifact_characters": artifact_characters,
         }
         
+        # Calcular tempo de execução
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Logar resposta com tempo
+        log_llm_response(
+            "PRD gerado com sucesso",
+            model_used,
+            provider_used,
+            tokens_used=usage_info.get("total_tokens"),
+            execution_time_ms=execution_time_ms
+        )
+        
         # Retorna a resposta e os metadados
         return {
             "content": normalized_content,
@@ -440,6 +645,7 @@ def call_llm(
         }
     
     except Exception as e:
+        log_exception("error", "Erro ao chamar LLM para PRD", e)
         print(f"Erro ao chamar a LLM: {e}")
         raise
 
@@ -452,6 +658,9 @@ def save_to_prd_documents(result: dict):
             "content": result.get("content"),
             "raw_output": result.get("raw_output"),
         }
+        
+        # Logar início do salvamento
+        log_info("save_document", "Iniciando salvamento de PRD")
 
         # Verifica qual cliente está sendo usado
         is_using_service_key = supabase_service_key is not None and supabase_service_key.strip() != ""
@@ -476,6 +685,14 @@ def save_to_prd_documents(result: dict):
 
         prd_record = response.data[0]
         prd_id = prd_record.get("prd_id")
+        
+        # Logar salvamento bem-sucedido
+        log_save_document(
+            "PRD salvo com sucesso",
+            "prd",
+            document_id=prd_id,
+            prd_id=prd_id
+        )
 
         try:
             write_client.table("agent_messages")\
@@ -489,12 +706,15 @@ def save_to_prd_documents(result: dict):
                 })\
                 .execute()
             print("log agent_messages registrado")
+            log_info("message_sent", f"Mensagem enviada para {ANALYZER_AGENT_NAME}", prd_id=prd_id)
         except Exception as log_error:
             print(f"⚠️  Falha ao registrar mensagem em agent_messages: {log_error}")
+            log_exception("error", "Erro ao registrar mensagem em agent_messages", log_error, prd_id=prd_id)
 
         return prd_record
 
     except Exception as e:
+        log_exception("error", "Erro ao salvar PRD no Supabase", e)
         error_msg = str(e)
         print(f"\n❌ Erro ao salvar no Supabase:")
         print(f"   Tipo: {type(e).__name__}")
@@ -527,6 +747,11 @@ def save_to_prd_documents(result: dict):
 
 
 if __name__ == "__main__":
+    # Inicializar logger
+    init_logger(PRD_AGENT_NAME, CONFIG_PARAMETERS)
+    agent_start_time = time.time()
+    log_agent_start("Iniciando execução do PRD Agent")
+    
     # Carrega mensagens e parâmetros a partir do arquivo de configuração
     user_msg = CONFIG_USER_MESSAGE
     system_msg = CONFIG_SYSTEM_MESSAGE
@@ -539,6 +764,29 @@ if __name__ == "__main__":
             "Defina user_message em system/prd_config.json ou forneça user_message explicitamente."
         )
 
+    # Detectar tipo de input (PRD ou erro)
+    print("🔍 Analisando tipo de input do usuário...")
+    input_type = detect_input_type(user_msg)
+    
+    if input_type == "error":
+        print("🐛 Input detectado como ERRO/BUG - roteando para Analyzer Agent")
+        log_info("message_sent", "Roteando erro para Analyzer Agent")
+        success = create_error_message_for_analyzer(user_msg)
+        if success:
+            print("✅ Erro roteado com sucesso para Analyzer Agent")
+            print("   Execute o analyzer para processar o erro e gerar relatório de impacto.")
+            log_info("message_sent", "Erro roteado com sucesso para Analyzer Agent")
+        else:
+            print("❌ Falha ao rotear erro para Analyzer Agent")
+            log_error("error", "Falha ao rotear erro para Analyzer Agent")
+        # Encerrar sem processar como PRD
+        execution_time_ms = int((time.time() - agent_start_time) * 1000)
+        log_agent_end("Execução do PRD Agent concluída (modo erro)", execution_time_ms=execution_time_ms)
+        raise SystemExit(0)
+    
+    print("📋 Input detectado como PRD - processando normalmente")
+    log_info("info", "Input detectado como PRD - processando normalmente")
+    
     # Fallback para Supabase quando informações essenciais não estão no arquivo local
     if system_msg is None or system_model is None or system_provider is None:
         fetched_msg, fetched_rev, fetched_model, fetched_provider = get_system_message()
@@ -580,4 +828,8 @@ if __name__ == "__main__":
     saved_record = save_to_prd_documents(resultado)
     prd_tokens = llm_meta['prd_tokens']
     print(f"prd salvo com sucesso: {prd_tokens} tokens")
+    
+    # Logar fim da execução
+    execution_time_ms = int((time.time() - agent_start_time) * 1000)
+    log_agent_end("Execução do PRD Agent concluída com sucesso", execution_time_ms=execution_time_ms, prd_id=saved_record.get("prd_id"))
 

@@ -2,6 +2,7 @@ import os
 import json
 import ast
 import re
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
@@ -9,6 +10,7 @@ from typing import Any, Iterable, Optional, Tuple, Union
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from llm_client import call_llm as llm_call_llm, openai_client, anthropic_client, gemini_client
+from logger import init_logger, log_agent_start, log_agent_end, log_llm_call, log_llm_response, log_parse_error, log_parse_success, log_save_document, log_exception, log_info
 
 # === Carregamento de configuração ===
 ENV_PATH = Path(__file__).parent.parent / ".env"
@@ -874,6 +876,16 @@ def call_llm(
         print("⚠️  Modelo claude solicitado com provider openai; usando gpt-4o por padrão.")
         model = "gpt-4o"
 
+    start_time = time.time()
+    model_used = model or "unknown"
+    provider_used = provider or "unknown"
+    
+    log_llm_call(
+        "Chamando LLM para gerar scaffold",
+        model_used,
+        provider_used
+    )
+
     result = llm_call_llm(
         system_message=system_message,
         user_message=user_message,
@@ -905,13 +917,31 @@ def call_llm(
     raw_output_str = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, ensure_ascii=False)
     print(f"📦 Raw output recebido: {len(raw_output_str)} caracteres")
     
+    # Logar resposta LLM
+    log_llm_response(
+        "Resposta LLM recebida para scaffold",
+        model_used,
+        provider_used,
+        tokens_used=usage_info.get("total_tokens"),
+        raw_response=raw_output_str[:5000]
+    )
+    
     # Contar artifacts no raw para validação
     artifacts_in_raw = _count_artifacts_in_raw(raw_output_str)
     if artifacts_in_raw > 0:
         print(f"📊 Artifacts detectados no raw_output: {artifacts_in_raw}")
     
     # Parsear com validação rigorosa (passa raw_output_str para validação)
-    normalized_content = parse_scaffold_content(raw_output, raw_output_str=raw_output_str)
+    try:
+        normalized_content = parse_scaffold_content(raw_output, raw_output_str=raw_output_str)
+        log_parse_success("Scaffold parseado com sucesso", parsed_size=len(str(normalized_content)))
+    except ValueError as parse_err:
+        log_parse_error(
+            "Erro ao parsear scaffold",
+            str(parse_err),
+            raw_data=raw_output_str[:10000]
+        )
+        raise
     
     # Contar artifacts dos grupos (não há mais campo artifacts)
     artifacts_count = 0
@@ -967,6 +997,15 @@ def save_to_scaffold_documents(result: dict, prd_id: Optional[str]) -> dict:
 
     scaffold_record = response.data[0]
     scaffold_id = scaffold_record.get("scaffold_id")
+    
+    # Logar salvamento
+    log_save_document(
+        "Scaffold salvo com sucesso",
+        "scaffold",
+        document_id=scaffold_id,
+        scaffold_id=scaffold_id,
+        prd_id=prd_id
+    )
 
     try:
         # Buscar analyzer_id da mensagem anterior se disponível
@@ -1081,6 +1120,11 @@ EXPECTED_FILE_KEYS = [
 
 
 if __name__ == "__main__":
+    # Inicializar logger
+    init_logger(SCAFFOLD_AGENT_NAME, CONFIG_PARAMETERS)
+    agent_start_time = time.time()
+    log_agent_start("Iniciando execução do Scaffold Agent")
+    
     base_user_msg = CONFIG_USER_MESSAGE
     if not base_user_msg:
         raise ValueError(
@@ -1195,6 +1239,11 @@ if __name__ == "__main__":
                 resultado["metadata"]["artifacts_count"] = filtered_count
 
         saved_record = save_to_scaffold_documents(resultado, prd_id)
+        scaffold_id = saved_record.get("scaffold_id")
+        
+        # Logar fim da execução
+        execution_time_ms = int((time.time() - agent_start_time) * 1000)
+        log_agent_end("Execução do Scaffold Agent concluída com sucesso", execution_time_ms=execution_time_ms, scaffold_id=scaffold_id, prd_id=prd_id)
         scaffold_tokens = llm_meta.get("scaffold_tokens")
         print(f"scaffold salvo com sucesso: {scaffold_tokens} tokens")
         print(f"scaffold_id: {saved_record.get('scaffold_id')}")
